@@ -21,10 +21,12 @@
 //! offset self-intersects and inverts. They are computed the classical way —
 //! raw offsets for every contour, cut at every intersection (with themselves
 //! **and with each other**), then discard each piece that is nearer than `w`
-//! to the path or on the wrong side of the fill, and stitch what survives.
-//! Cutting across contours matters: it is what makes overlapping bands merge
-//! into one boundary instead of two overlapping ones, which nonzero winding
-//! could not express.
+//! to the path, on the wrong side of the fill, or inside another loop's
+//! region (a winding test against the raw loops themselves — required for
+//! miter/bevel joins, whose loops deviate from the distance-`w` set at
+//! corners), and stitch what survives. Cutting across contours matters: it
+//! is what makes overlapping bands merge into one boundary instead of two
+//! overlapping ones, which nonzero winding could not express.
 //!
 //! When nothing survives, the erosion is empty and the stroke **saturates**:
 //! the shape is filled completely (a wedge, a thin star, a rectangle narrower
@@ -68,9 +70,12 @@ pub(crate) struct ContourSpec<'a> {
 /// and its edges bucketed by `y`, so a query touches only the edges that can
 /// matter. Flattening error is folded into the distance threshold.
 pub(crate) struct SourceIndex {
-    /// `(a, b, real)`; `real == false` marks an implicit closing edge, which
-    /// counts for winding but is not part of the path for distance.
-    edges: Vec<(Point, Point, bool)>,
+    /// `(a, b, real, contour)`; `real == false` marks an implicit closing
+    /// edge, which counts for winding but is not part of the path for
+    /// distance. `contour` is the subpath ordinal, so the distance test can
+    /// be restricted to a piece's own contour (cross-contour validity is a
+    /// winding question, not a distance one — see `region_loops`).
+    edges: Vec<(Point, Point, bool, u32)>,
     buckets: Vec<Vec<u32>>,
     y0: f64,
     inv_h: f64,
@@ -80,27 +85,36 @@ pub(crate) struct SourceIndex {
 impl SourceIndex {
     pub(crate) fn new(path: &BezPath, flat_tol: f64) -> Self {
         let flat_tol = flat_tol.max(1e-9);
-        let mut edges: Vec<(Point, Point, bool)> = Vec::new();
+        let mut edges: Vec<(Point, Point, bool, u32)> = Vec::new();
         let mut last: Option<Point> = None;
         let mut start: Option<Point> = None;
-        let close =
-            |edges: &mut Vec<(Point, Point, bool)>, last: Option<Point>, s: Option<Point>| {
-                if let (Some(prev), Some(s)) = (last, s) {
-                    if (s - prev).hypot2() > 0.0 {
-                        edges.push((prev, s, false));
-                    }
+        let mut sub: u32 = 0;
+        let mut seen_move = false;
+        let close = |edges: &mut Vec<(Point, Point, bool, u32)>,
+                     last: Option<Point>,
+                     s: Option<Point>,
+                     sub: u32| {
+            if let (Some(prev), Some(s)) = (last, s) {
+                if (s - prev).hypot2() > 0.0 {
+                    edges.push((prev, s, false, sub));
                 }
-            };
+            }
+        };
         kurbo::flatten(path.iter(), flat_tol, |el| match el {
             PathEl::MoveTo(p) => {
-                close(&mut edges, last, start);
+                close(&mut edges, last, start, sub);
+                if seen_move {
+                    sub += 1;
+                } else {
+                    seen_move = true;
+                }
                 last = Some(p);
                 start = Some(p);
             }
             PathEl::LineTo(p) => {
                 if let Some(prev) = last {
                     if (p - prev).hypot2() > 0.0 {
-                        edges.push((prev, p, true));
+                        edges.push((prev, p, true, sub));
                     }
                 }
                 last = Some(p);
@@ -108,17 +122,17 @@ impl SourceIndex {
             PathEl::ClosePath => {
                 if let (Some(prev), Some(s)) = (last, start) {
                     if (s - prev).hypot2() > 0.0 {
-                        edges.push((prev, s, true));
+                        edges.push((prev, s, true, sub));
                     }
                 }
                 last = start;
             }
             _ => {}
         });
-        close(&mut edges, last, start);
+        close(&mut edges, last, start, sub);
 
         let (mut ymin, mut ymax) = (f64::INFINITY, f64::NEG_INFINITY);
-        for (a, b, _) in &edges {
+        for (a, b, _, _) in &edges {
             ymin = ymin.min(a.y).min(b.y);
             ymax = ymax.max(a.y).max(b.y);
         }
@@ -134,7 +148,7 @@ impl SourceIndex {
             };
         }
         let inv_h = n_buckets as f64 / (ymax - ymin).max(1e-12);
-        for (i, (a, b, _)) in edges.iter().enumerate() {
+        for (i, (a, b, _, _)) in edges.iter().enumerate() {
             let lo = (((a.y.min(b.y) - ymin) * inv_h) as usize).min(n_buckets - 1);
             let hi = (((a.y.max(b.y) - ymin) * inv_h) as usize).min(n_buckets - 1);
             for bucket in &mut buckets[lo..=hi] {
@@ -156,7 +170,7 @@ impl SourceIndex {
         if n == 0 {
             return None;
         }
-        let ix = (((y - self.y0) * self.inv_h).floor()).clamp(0.0, (n - 1) as f64) as usize;
+        let ix = crate::math::floor((y - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64) as usize;
         Some(&self.buckets[ix])
     }
 
@@ -165,17 +179,20 @@ impl SourceIndex {
         if n == 0 {
             return (0, 0);
         }
-        let lo = (((lo_y - self.y0) * self.inv_h).floor()).clamp(0.0, (n - 1) as f64) as usize;
-        let hi = (((hi_y - self.y0) * self.inv_h).ceil()).clamp(0.0, (n - 1) as f64) as usize;
+        let lo =
+            crate::math::floor((lo_y - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64) as usize;
+        let hi =
+            crate::math::ceil((hi_y - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64) as usize;
         (lo, hi)
     }
 
-    /// Whether `p` is at least `sqrt(thresh_sq)` away from the whole path.
+    /// Whether `p` is at least `sqrt(thresh_sq)` away from contour
+    /// `contour` of the path (`None`: away from the whole path).
     ///
     /// Phrased as a predicate rather than a distance: a segment whose box is
     /// already beyond the threshold cannot disqualify the point, and the
     /// first violation ends the scan.
-    fn is_clear_of(&self, p: Point, thresh_sq: f64) -> bool {
+    fn is_clear_of(&self, p: Point, thresh_sq: f64, contour: Option<usize>) -> bool {
         if thresh_sq <= 0.0 {
             return true;
         }
@@ -183,8 +200,8 @@ impl SourceIndex {
         let (lo, hi) = self.bucket_range(p.y - r, p.y + r);
         for bi in lo..=hi {
             for &ix in &self.buckets[bi] {
-                let (a, b, real) = self.edges[ix as usize];
-                if !real {
+                let (a, b, real, sub) = self.edges[ix as usize];
+                if !real || contour.is_some_and(|c| c as u32 != sub) {
                     continue;
                 }
                 let (x0, x1) = if a.x <= b.x { (a.x, b.x) } else { (b.x, a.x) };
@@ -219,7 +236,7 @@ impl SourceIndex {
         };
         let mut w = 0;
         for &ix in bucket {
-            let (a, b, _) = self.edges[ix as usize];
+            let (a, b, _, _) = self.edges[ix as usize];
             if a.y <= p.y {
                 if b.y > p.y && (b - a).cross(p - a) > 0.0 {
                     w += 1;
@@ -234,6 +251,160 @@ impl SourceIndex {
     /// Flattening tolerance, subtracted from distance thresholds.
     fn slack(&self) -> f64 {
         self.flat_tol
+    }
+}
+
+/// Flattened raw offset loops with per-edge owner tags.
+///
+/// Backs the cross-contour membership test: a piece of loop `i` belongs to
+/// the region boundary only where the *other* loops' winding matches the
+/// expected value. Distance to the source path cannot express this for
+/// miter/bevel joins, whose loops deviate from the distance-`w` set at
+/// corners (a miter wedge reaches past `w`, and an arc of another contour
+/// hiding inside that wedge must still be pruned).
+struct RawIndex {
+    /// `(a, b, owner)` flattened edges.
+    edges: Vec<(Point, Point, u32)>,
+    buckets: Vec<Vec<u32>>,
+    y0: f64,
+    inv_h: f64,
+}
+
+impl RawIndex {
+    fn new(raws: &[BezPath], flat_tol: f64) -> RawIndex {
+        let mut edges: Vec<(Point, Point, u32)> = Vec::new();
+        for (ix, raw) in raws.iter().enumerate() {
+            let mut last: Option<Point> = None;
+            let mut start: Option<Point> = None;
+            kurbo::flatten(raw.iter(), flat_tol.max(1e-9), |el| match el {
+                PathEl::MoveTo(p) => {
+                    last = Some(p);
+                    start = Some(p);
+                }
+                PathEl::LineTo(p) => {
+                    if let Some(prev) = last {
+                        if (p - prev).hypot2() > 0.0 {
+                            edges.push((prev, p, ix as u32));
+                        }
+                    }
+                    last = Some(p);
+                }
+                PathEl::ClosePath => {
+                    if let (Some(prev), Some(s)) = (last, start) {
+                        if (s - prev).hypot2() > 0.0 {
+                            edges.push((prev, s, ix as u32));
+                        }
+                    }
+                    last = start;
+                }
+                _ => {}
+            });
+            // The raw loops are explicitly closed, but guard anyway.
+            if let (Some(prev), Some(s)) = (last, start) {
+                if (s - prev).hypot2() > 0.0 {
+                    edges.push((prev, s, ix as u32));
+                }
+            }
+        }
+
+        let (mut ymin, mut ymax) = (f64::INFINITY, f64::NEG_INFINITY);
+        for (a, b, _) in &edges {
+            ymin = ymin.min(a.y).min(b.y);
+            ymax = ymax.max(a.y).max(b.y);
+        }
+        let n_buckets = (edges.len() / 4).clamp(1, 256);
+        let mut buckets: Vec<Vec<u32>> = alloc::vec![Vec::new(); n_buckets];
+        if edges.is_empty() {
+            return RawIndex {
+                edges,
+                buckets,
+                y0: 0.0,
+                inv_h: 0.0,
+            };
+        }
+        let inv_h = n_buckets as f64 / (ymax - ymin).max(1e-12);
+        for (i, (a, b, _)) in edges.iter().enumerate() {
+            let lo = (((a.y.min(b.y) - ymin) * inv_h) as usize).min(n_buckets - 1);
+            let hi = (((a.y.max(b.y) - ymin) * inv_h) as usize).min(n_buckets - 1);
+            for bucket in &mut buckets[lo..=hi] {
+                bucket.push(i as u32);
+            }
+        }
+        RawIndex {
+            edges,
+            buckets,
+            y0: ymin,
+            inv_h,
+        }
+    }
+
+    /// Nonzero winding at `p` of every loop except `owner`'s.
+    ///
+    /// Single-bucket scan, same reasoning as [`SourceIndex::winding`].
+    fn winding_excluding(&self, p: Point, owner: usize) -> i32 {
+        let n = self.buckets.len();
+        if n == 0 {
+            return 0;
+        }
+        let ix =
+            crate::math::floor((p.y - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64) as usize;
+        let mut w = 0;
+        for &ei in &self.buckets[ix] {
+            let (a, b, o) = self.edges[ei as usize];
+            if o as usize == owner {
+                continue;
+            }
+            if a.y <= p.y {
+                if b.y > p.y && (b - a).cross(p - a) > 0.0 {
+                    w += 1;
+                }
+            } else if b.y <= p.y && (b - a).cross(p - a) < 0.0 {
+                w -= 1;
+            }
+        }
+        w
+    }
+
+    /// Whether `p` lies within `sqrt(r_sq)` of any loop except `owner`'s.
+    ///
+    /// A piece that close to another loop cannot be classified by winding —
+    /// the loops locally coincide (a donut at exactly half its ring
+    /// thickness) — and is pruned instead, collapsing sub-resolution
+    /// regions to clean saturation.
+    fn is_near_other(&self, p: Point, r_sq: f64, owner: usize) -> bool {
+        let n = self.buckets.len();
+        if n == 0 || r_sq <= 0.0 {
+            return false;
+        }
+        let r = crate::math::sqrt(r_sq);
+        let lo = crate::math::floor((p.y - r - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64)
+            as usize;
+        let hi =
+            crate::math::ceil((p.y + r - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64) as usize;
+        for bi in lo..=hi {
+            for &ei in &self.buckets[bi] {
+                let (a, b, o) = self.edges[ei as usize];
+                if o as usize == owner {
+                    continue;
+                }
+                let (x0, x1) = if a.x <= b.x { (a.x, b.x) } else { (b.x, a.x) };
+                let dx = (x0 - p.x).max(p.x - x1).max(0.0);
+                if dx * dx >= r_sq {
+                    continue;
+                }
+                let ab = b - a;
+                let len2 = ab.hypot2();
+                let t = if len2 > 0.0 {
+                    ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                if ((p - a) - t * ab).hypot2() < r_sq {
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -254,8 +425,16 @@ pub(crate) fn region_loops(
     scratch: &mut BezPath,
     sink: &mut BezPath,
 ) -> Vec<BezPath> {
+    // Resolution of the pruning predicate: offset approximation, tolerance
+    // and flattening error stack up to about this length. Features smaller
+    // than it fall inside the documented boundary band.
+    let fuzz = PRUNE_SLACK * width + 2.0 * base.tolerance + index.slack();
+
     // --- raw offsets, one per contour ---
     let mut raws: Vec<BezPath> = Vec::with_capacity(contours.len());
+    // Per-raw, per-segment flags marking outer-side join geometry (exempt
+    // from the distance prune; see `keep_at`).
+    let mut raws_join: Vec<Vec<bool>> = Vec::with_capacity(contours.len());
     for c in contours {
         let side = match kind {
             RegionKind::Erosion => c.fill_side,
@@ -269,11 +448,16 @@ pub(crate) fn region_loops(
             raw_offset: true,
             ..*base
         };
-        {
+        let join_spans = {
             let mut band = Band::new(params, left, right, scratch, sink);
             band.suppress_finish = true;
             band.run(c.els.iter().copied());
-        }
+            if side == StrokeSide::Left {
+                core::mem::take(&mut band.left_join_segs)
+            } else {
+                core::mem::take(&mut band.right_join_segs)
+            }
+        };
         let raw: &BezPath = if side == StrokeSide::Left {
             left
         } else {
@@ -281,87 +465,265 @@ pub(crate) fn region_loops(
         };
         if raw.elements().len() < 2 {
             raws.push(BezPath::new());
+            raws_join.push(Vec::new());
             continue;
         }
         let mut closed = raw.clone();
         closed.close_path();
+        // Collapsed offset (width at the local thickness): the loop
+        // degenerates to a tolerance-scale cluster, which `offset_cubic`'s
+        // cusp handling can shatter into thousands of segments — and the
+        // pairwise cut of that cluster is quadratic in them. A loop smaller
+        // than the pruning fuzz cannot bound a resolvable region feature;
+        // drop it before it reaches the cutter.
+        if closed.control_box().size().max_side() <= fuzz {
+            raws.push(BezPath::new());
+            raws_join.push(Vec::new());
+            continue;
+        }
+        let n_segs = closed.segments().count();
+        let mut flags = alloc::vec![false; n_segs];
+        for (s0, s1) in join_spans {
+            for flag in flags
+                .iter_mut()
+                .take((s1 as usize).min(n_segs))
+                .skip(s0 as usize)
+            {
+                *flag = true;
+            }
+        }
         raws.push(closed);
+        raws_join.push(flags);
     }
 
-    // --- cut every offset against itself and all the others ---
-    let cut = cut_all(&raws, accuracy);
+    // --- find every mutual and self intersection of the offsets ---
+    let cut = CutSegs::collect(&raws, &raws_join, accuracy);
 
-    // --- prune ---
     let thresh = (width * (1.0 - PRUNE_SLACK) - 2.0 * base.tolerance - index.slack()).max(0.0);
     let thresh_sq = thresh * thresh;
     let want_filled = kind == RegionKind::Erosion;
-    let kept: Vec<Option<(usize, PathSeg)>> = cut
-        .into_iter()
-        .map(|(owner, seg)| {
-            let p = seg.eval(0.5);
-            // Distance first: it rejects most pieces and is the cheaper test.
-            let keep = index.is_clear_of(p, thresh_sq) && (index.winding(p) != 0) == want_filled;
-            keep.then_some((owner, seg))
-        })
-        .collect();
-
-    stitch(&kept, accuracy)
-}
-
-/// Cut a family of closed offset curves at all of their mutual and self
-/// intersections. Returns `(owner, piece)` in owner-major path order.
-fn cut_all(raws: &[BezPath], accuracy: f64) -> Vec<(usize, PathSeg)> {
-    // Flatten to a segment list, remembering the owner and the index range of
-    // each contour so adjacency can be recognised.
-    let mut segs: Vec<PathSeg> = Vec::new();
-    let mut owner: Vec<usize> = Vec::new();
-    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(raws.len());
-    for (ix, raw) in raws.iter().enumerate() {
-        let start = segs.len();
-        for seg in raw.segments() {
-            segs.push(seg);
-            owner.push(ix);
+    // Cross-contour membership needs the *other* raw loops' winding: with
+    // miter/bevel joins a loop deviates from the distance-`w` set at
+    // corners, so distance alone cannot tell whether a piece hides inside
+    // another contour's region. Expected winding follows the owning loop's
+    // orientation: 0 for outer-like (CW) loops, +1 for hole-like (CCW)
+    // loops, whose enclosing outer loop contributes one turn. Only needed
+    // when two or more loops are live.
+    // Loop orientation, taken from the *source* contour (the loop inherits
+    // its travel direction; the raw loop's own net area is unreliable when
+    // the offset self-intersects, e.g. the overshoot star of a sharp
+    // triangle's inward offset).
+    let cw: Vec<bool> = contours.iter().map(|c| c.els.area() >= 0.0).collect();
+    let live = raws.iter().filter(|r| r.elements().len() >= 2).count();
+    let raw_index = (live >= 2).then(|| RawIndex::new(&raws, index.slack()));
+    let keep_at = |p: Point, owner: usize, is_join: bool| {
+        // Self-validity: far enough from the piece's *own* contour (prunes
+        // fold-over past the local thickness). Only the own contour —
+        // proximity to another contour says nothing under miter/bevel
+        // joins, whose loops deviate from the distance-`w` set at corners;
+        // cross-contour validity is the winding test below. Join geometry
+        // is exempt (a bevel chord legitimately cuts the corner to w/√2).
+        if !is_join && !index.is_clear_of(p, thresh_sq, Some(owner)) {
+            return false;
         }
-        ranges.push((start, segs.len()));
-    }
-    let n = segs.len();
-    let bboxes: Vec<Rect> = segs
-        .iter()
-        .map(kurbo::ParamCurveExtrema::bounding_box)
-        .collect();
-    let mut cuts: Vec<Vec<f64>> = alloc::vec![Vec::new(); n];
-
-    for i in 0..n {
-        for t in split::segment_self_intersection_params(&segs[i], accuracy) {
-            cuts[i].push(t);
+        // The right side of the fill.
+        if (index.winding(p) != 0) != want_filled {
+            return false;
         }
-        for j in (i + 1)..n {
-            // Cheap box rejection before the subdivision search.
-            let (a, b) = (bboxes[i], bboxes[j]);
-            if a.x0 > b.x1 + accuracy
-                || b.x0 > a.x1 + accuracy
-                || a.y0 > b.y1 + accuracy
-                || b.y0 > a.y1 + accuracy
-            {
+        // Not swallowed by (or escaped from) the other loops' region, and
+        // not so close to another loop that the winding answer is fuzz.
+        match &raw_index {
+            None => true,
+            Some(ri) => {
+                let expected = if cw[owner] { 0 } else { 1 };
+                ri.winding_excluding(p, owner) == expected
+                    && !ri.is_near_other(p, fuzz * fuzz, owner)
+            }
+        }
+    };
+
+    // --- fast path: nothing cuts ---
+    // Validity flips only across an intersection (segment joints are piece
+    // boundaries already), so with no interior cuts every loop is uniformly
+    // valid or invalid: classify each by a few midpoint samples and skip
+    // subdivision, per-piece pruning and stitching. Disagreeing samples are
+    // possible only within the boundary band; fall back to the full
+    // pipeline for those.
+    if !cut.any_interior {
+        let mut keep = alloc::vec![false; raws.len()];
+        let mut mixed = false;
+        for (ri, raw) in raws.iter().enumerate() {
+            let n = raw.segments().count();
+            if n == 0 {
                 continue;
             }
-            let same = owner[i] == owner[j];
-            let (lo, hi) = ranges[owner[i]];
-            let adjacent = same && (j == i + 1 || (i == lo && j == hi - 1));
-            for (ta, tb) in split::segment_pair_params(&segs[i], &segs[j], adjacent, accuracy) {
-                cuts[i].push(ta);
-                cuts[j].push(tb);
+            let sample_ixs = [0, n / 2, n - 1];
+            let (mut valid, mut invalid) = (0usize, 0usize);
+            for (ix, seg) in raw.segments().enumerate() {
+                if sample_ixs.contains(&ix) {
+                    let is_join = raws_join[ri].get(ix).copied().unwrap_or(false);
+                    if keep_at(seg.eval(0.5), ri, is_join) {
+                        valid += 1;
+                    } else {
+                        invalid += 1;
+                    }
+                }
             }
+            if invalid == 0 {
+                keep[ri] = substantial_loop(raw, accuracy);
+            } else if valid > 0 {
+                mixed = true;
+                break;
+            }
+        }
+        if !mixed {
+            let loops = raws
+                .into_iter()
+                .zip(keep)
+                .filter_map(|(raw, keep)| keep.then_some(raw))
+                .collect();
+            return drop_unresolvable(loops, fuzz);
         }
     }
 
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        for piece in split::subdivide_at(&segs[i], &mut cuts[i]) {
-            out.push((owner[i], piece));
+    // --- cut, prune, stitch ---
+    let kept: Vec<Option<(usize, PathSeg)>> = cut
+        .materialize()
+        .into_iter()
+        .map(|(owner, seg, is_join)| keep_at(seg.eval(0.5), owner, is_join).then_some((owner, seg)))
+        .collect();
+
+    drop_unresolvable(stitch(&kept, accuracy), fuzz)
+}
+
+/// Empty out a region that is thinner than the pipeline's resolution.
+///
+/// The loops describe the region by nonzero winding with consistent
+/// orientations, so the net signed area *is* the region's area, and
+/// `net / perimeter` bounds its mean thickness. A region thinner than the
+/// fuzz everywhere sits inside the documented boundary band — most
+/// importantly the cancel pair stitched from two nearly coincident offsets
+/// (a donut at exactly half its ring thickness), which otherwise ships
+/// hundreds of fuzz segments that paint nothing.
+fn drop_unresolvable(loops: Vec<BezPath>, fuzz: f64) -> Vec<BezPath> {
+    let net: f64 = loops.iter().map(|l| l.elements().area()).sum();
+    let mut perimeter = 0.0;
+    for l in &loops {
+        for seg in l.segments() {
+            perimeter += (seg.end() - seg.start()).hypot();
         }
     }
-    out
+    if net.abs() <= 0.5 * fuzz * perimeter.max(1.0) {
+        Vec::new()
+    } else {
+        loops
+    }
+}
+
+/// The segments of a family of closed offset curves, with every mutual and
+/// self intersection collected as cut parameters.
+struct CutSegs {
+    segs: Vec<PathSeg>,
+    owner: Vec<usize>,
+    /// Outer-side join geometry flag per segment (distance-prune exempt).
+    join: Vec<bool>,
+    cuts: Vec<Vec<f64>>,
+    /// Whether any cut lands in a segment's interior. Endpoint touches are
+    /// dropped by `subdivide_at` anyway, so without interior cuts the
+    /// subdivision is a no-op and the fast path applies.
+    any_interior: bool,
+}
+
+impl CutSegs {
+    fn collect(raws: &[BezPath], raws_join: &[Vec<bool>], accuracy: f64) -> CutSegs {
+        // Flatten to a segment list, remembering the owner and the index
+        // range of each contour so adjacency can be recognised.
+        let mut segs: Vec<PathSeg> = Vec::new();
+        let mut owner: Vec<usize> = Vec::new();
+        let mut join: Vec<bool> = Vec::new();
+        let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(raws.len());
+        for (ix, raw) in raws.iter().enumerate() {
+            let start = segs.len();
+            for (k, seg) in raw.segments().enumerate() {
+                segs.push(seg);
+                owner.push(ix);
+                join.push(raws_join[ix].get(k).copied().unwrap_or(false));
+            }
+            ranges.push((start, segs.len()));
+        }
+        let n = segs.len();
+        let bboxes: Vec<Rect> = segs
+            .iter()
+            .map(kurbo::ParamCurveExtrema::bounding_box)
+            .collect();
+        let mut cuts: Vec<Vec<f64>> = alloc::vec![Vec::new(); n];
+        let mut any_interior = false;
+        let add = |cuts: &mut Vec<Vec<f64>>, any: &mut bool, ix: usize, t: f64| {
+            *any |= t > split::T_EPS && t < 1.0 - split::T_EPS;
+            cuts[ix].push(t);
+        };
+
+        for i in 0..n {
+            for t in split::segment_self_intersection_params(&segs[i], accuracy) {
+                add(&mut cuts, &mut any_interior, i, t);
+            }
+            for j in (i + 1)..n {
+                // Cheap box rejection before the subdivision search.
+                let (a, b) = (bboxes[i], bboxes[j]);
+                if a.x0 > b.x1 + accuracy
+                    || b.x0 > a.x1 + accuracy
+                    || a.y0 > b.y1 + accuracy
+                    || b.y0 > a.y1 + accuracy
+                {
+                    continue;
+                }
+                let same = owner[i] == owner[j];
+                let (lo, hi) = ranges[owner[i]];
+                let next = same && j == i + 1;
+                let wrap = same && i == lo && j == hi - 1 && hi - lo > 1;
+                for (ta, tb) in split::segment_pair_params(&segs[i], &segs[j], next, wrap, accuracy)
+                {
+                    add(&mut cuts, &mut any_interior, i, ta);
+                    add(&mut cuts, &mut any_interior, j, tb);
+                }
+            }
+        }
+        CutSegs {
+            segs,
+            owner,
+            join,
+            cuts,
+            any_interior,
+        }
+    }
+
+    /// Subdivide every segment at its cuts. Returns `(owner, piece, join)`
+    /// in owner-major path order.
+    fn materialize(mut self) -> Vec<(usize, PathSeg, bool)> {
+        let mut out = Vec::with_capacity(self.segs.len());
+        for i in 0..self.segs.len() {
+            for piece in split::subdivide_at(&self.segs[i], &mut self.cuts[i]) {
+                out.push((self.owner[i], piece, self.join[i]));
+            }
+        }
+        out
+    }
+}
+
+/// Whether a closed loop bounds meaningful area: its |signed area| must
+/// exceed a perimeter-proportional sliver threshold. This catches both tiny
+/// loops (the erosion collapsing at the saturation width) and long
+/// near-degenerate rings (the fuzz stitched from two nearly coincident
+/// offsets, e.g. a donut whose inward offsets meet in the middle).
+fn substantial_loop(path: &BezPath, accuracy: f64) -> bool {
+    if path.elements().len() < 4 {
+        return false;
+    }
+    let mut perimeter = 0.0;
+    for seg in path.segments() {
+        perimeter += (seg.end() - seg.start()).hypot();
+    }
+    path.elements().area().abs() > 2.0 * accuracy * perimeter.max(1.0)
 }
 
 /// Reassemble surviving pieces into closed loops.
@@ -412,13 +774,9 @@ fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64) -> Vec<BezPath> {
         }
         path.close_path();
         // Drop slivers: at exactly the saturation width the erosion collapses
-        // to a zero-area curve, which paints nothing but costs segments.
-        if path.elements().len() >= 4 {
-            let bb = path.bounding_box();
-            let sliver = accuracy * (bb.width() + bb.height()).max(1.0);
-            if path.elements().area().abs() > sliver {
-                loops.push(path);
-            }
+        // to a near-zero-area curve, which paints nothing but costs segments.
+        if substantial_loop(&path, accuracy) {
+            loops.push(path);
         }
     }
     loops
@@ -553,5 +911,25 @@ mod tests {
         assert_eq!(loops.len(), 1);
         let bb = loops[0].bounding_box();
         assert!(bb.x0 <= -24.0 && bb.y0 <= -24.0 && bb.x1 >= 104.0 && bb.y1 >= 84.0);
+    }
+
+    /// Smooth offsets have no intersections: the fast path must return the
+    /// analytically correct erosion, and the collapse at w = r must yield
+    /// the empty region (saturation), not a shredded point cluster.
+    #[test]
+    fn circle_erosion_fast_path_and_collapse() {
+        let c = kurbo::Circle::new((0.0, 0.0), 50.0).to_path(1e-7);
+        let loops = loops_for(&c, StrokeSide::Right, RegionKind::Erosion, 10.0);
+        assert_eq!(loops.len(), 1, "circle erosion is a single loop");
+        let area = loops[0].elements().area().abs();
+        let expected = core::f64::consts::PI * 40.0 * 40.0;
+        assert!(
+            (area - expected).abs() < expected * 0.01,
+            "eroded circle area {area:.1} vs analytic {expected:.1}"
+        );
+        assert!(
+            loops_for(&c, StrokeSide::Right, RegionKind::Erosion, 50.0).is_empty(),
+            "collapsed offset at w = r must saturate"
+        );
     }
 }

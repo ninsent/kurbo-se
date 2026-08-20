@@ -59,7 +59,10 @@
 //! - **Open subpaths**: inside/outside is geometrically undefined, so kurbo-se
 //!   uses the documented convention `Inside → Right`, `Outside → Left`
 //!   (relative to travel direction). Set [`StrokeStyle::side`] to pick a side
-//!   explicitly.
+//!   explicitly. Open subpaths are banded independently of the closed
+//!   contours' region construction: a nearby open subpath never prunes or
+//!   masks a closed contour's inside/outside band, and overlapping bands
+//!   simply add under nonzero winding.
 //!
 //! # Quickstart
 //!

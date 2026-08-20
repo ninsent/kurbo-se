@@ -88,6 +88,13 @@ pub(crate) struct Band<'a> {
     /// leaves the boundary accumulators intact — used by the width-clamp
     /// probe to inspect a candidate offset boundary.
     pub(crate) suppress_finish: bool,
+    /// Segment-index ranges of *outer-side* join geometry emitted in
+    /// `raw_offset` mode (bevel chords, miter legs, round fans), per
+    /// boundary. The region pruner exempts these from the distance test:
+    /// join geometry legitimately deviates from distance `w` (a bevel chord
+    /// cuts to `w/√2`), while inner-side overshoot must stay prunable.
+    pub(crate) left_join_segs: alloc::vec::Vec<(u32, u32)>,
+    pub(crate) right_join_segs: alloc::vec::Vec<(u32, u32)>,
 }
 
 impl<'a> Band<'a> {
@@ -112,6 +119,8 @@ impl<'a> Band<'a> {
             last_pt: Point::ORIGIN,
             last_tan: Vec2::ZERO,
             suppress_finish: false,
+            left_join_segs: alloc::vec::Vec::new(),
+            right_join_segs: alloc::vec::Vec::new(),
         }
     }
 
@@ -326,6 +335,12 @@ impl<'a> Band<'a> {
             }
             return;
         }
+        // Raw-offset mode: remember which segments the outer-side join is
+        // about to emit, so the region pruner can exempt them from the
+        // distance test (see the field docs).
+        let tag_left = self.p.raw_offset && cross > 0.0 && self.p.d_left > 0.0;
+        let tag_right = self.p.raw_offset && cross < 0.0 && self.p.d_right > 0.0;
+        let (l0, r0) = (self.left.elements().len(), self.right.elements().len());
         if self.p.raw_offset {
             // Raw mode: fall through to the plain join emission below, which
             // bevels the inner side (the overshoot loop the pruner needs).
@@ -393,6 +408,15 @@ impl<'a> Band<'a> {
                     }
                 }
             }
+        }
+        // Segment index = element index − 1 (the leading MoveTo).
+        if tag_left && self.left.elements().len() > l0 {
+            self.left_join_segs
+                .push((l0 as u32 - 1, self.left.elements().len() as u32 - 1));
+        }
+        if tag_right && self.right.elements().len() > r0 {
+            self.right_join_segs
+                .push((r0 as u32 - 1, self.right.elements().len() as u32 - 1));
         }
     }
 

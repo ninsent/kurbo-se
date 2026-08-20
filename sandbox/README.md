@@ -15,6 +15,8 @@ npm run dev
 `npm run dev` builds the wasm module (via `wasm-pack`, which must be on your
 PATH: `cargo install wasm-pack`) and starts Vite. Edits to any `.rs` file in
 `kurbo-se/src` or `sandbox/wasm/src` rebuild the wasm and reload the page.
+Dev builds compile with `opt-level = 2` (unoptimized geometry is ~20×
+slower and feels laggy); `npm run build` uses `wasm-pack --release`.
 
 ## What's on screen
 

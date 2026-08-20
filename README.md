@@ -68,7 +68,9 @@ Width profiles are out of scope.
 - **Open subpaths:** inside/outside is geometrically undefined; kurbo-se
   maps `Inside → Right`, `Outside → Left` of the travel direction (the
   SVG Strokes draft's suggested aliasing) and lets you set `side`
-  explicitly.
+  explicitly. Open subpaths are banded independently of the closed
+  contours' region construction — a nearby open subpath never carves into
+  a closed contour's inside/outside band; overlapping bands just add.
 - **Dashing order:** the side is resolved from the undashed subpath, dashes
   are cut from the original centerline (lengths never distort with
   alignment), then each dash is expanded independently. Closed contours
@@ -84,17 +86,22 @@ Measured on an Apple-silicon laptop, tolerance 0.25 (criterion, release):
 
 | Case | time |
 |---|---|
-| 10-point star (lines), inside, solid | 7.0 µs |
-| circle (62 segs), center, solid | 13.5 µs (kurbo's native stroker: 12.6 µs) |
-| circle (62 segs), inside, solid | 46 µs |
-| circle, inside, dashed + round dash caps | 30 µs |
-| 40-cubic wavy path, inside, solid | 120 µs |
-| 40-cubic wavy path, inside, dashed | 154 µs |
+| 10-point star (lines), inside, solid | 4.4 µs |
+| circle (62 segs), center, solid | 13.9 µs (kurbo's native stroker: 13.0 µs) |
+| circle (62 segs), inside, solid | 31 µs |
+| circle, inside, dashed + round dash caps | 31 µs |
+| donut (124 segs, hole), inside, solid | 80 µs |
+| 40-cubic wavy path, inside, solid | 107 µs |
+| 40-cubic wavy path, inside, dashed | 144 µs |
 
 Centered strokes take a direct path and cost about the same as kurbo's own
-stroker. One-sided strokes pay for the region construction (offsetting,
-cutting at intersections, pruning, stitching); polylines — the common UI
-case — stay in the single-digit microseconds.
+stroker. One-sided strokes pay for the region construction, but when the
+raw offsets don't intersect — every smooth contour at moderate width — a
+fast path classifies each offset loop whole and skips the cut/prune/stitch
+machinery; polylines — the common UI case — stay in the single-digit
+microseconds. Degenerate widths (an offset collapsing to a point at
+`w = r`, or two offsets coinciding at half a ring's thickness) are guarded
+and stay near a millisecond instead of shredding into pathological work.
 
 Re-expanding per frame (e.g. animating `dash.offset`) is the supported
 model — no caching layer needed. Use [`stroke_aligned_with`] with a reused
@@ -131,7 +138,10 @@ and, gratefully, the design.
 - **Boundary band:** classification within roughly one tolerance of
   `dist = w` is approximate — the offset curve, the flattened distance
   index and the cut positions each carry tolerance-scale error. Region
-  membership is exact everywhere else.
+  membership is exact everywhere else. Consequently, a region component
+  thinner than that band everywhere (the sliver annulus of a donut stroked
+  at *exactly* half its ring thickness) collapses to clean saturation
+  rather than rendering as sub-tolerance fuzz.
 - **Interleaved self-intersections:** a contour whose crossings nest
   irregularly (a pretzel) decomposes only partially into lobes; the result
   is still finite, contained and artifact-reduced, but the lobe split is

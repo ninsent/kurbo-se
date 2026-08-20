@@ -7,10 +7,13 @@ const root = path.dirname(new URL(import.meta.url).pathname);
 /** Build the wasm crate with wasm-pack; rebuild + reload when Rust changes. */
 function wasmPack(): Plugin {
   let building = false;
+  // Dev server: --dev (fast rebuilds; opt-level 2 via wasm/Cargo.toml).
+  // Production build: --release.
+  let profileFlag = "--dev";
   const build = () => {
     building = true;
     try {
-      execSync("wasm-pack build wasm --target web --dev --out-dir pkg", {
+      execSync(`wasm-pack build wasm --target web ${profileFlag} --out-dir pkg`, {
         cwd: root,
         stdio: "inherit",
       });
@@ -20,6 +23,9 @@ function wasmPack(): Plugin {
   };
   return {
     name: "wasm-pack",
+    configResolved(config) {
+      profileFlag = config.command === "build" ? "--release" : "--dev";
+    },
     buildStart() {
       build();
     },

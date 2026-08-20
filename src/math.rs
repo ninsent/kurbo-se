@@ -82,6 +82,18 @@ pub(crate) fn ceil(x: f64) -> f64 {
     }
 }
 
+#[inline]
+pub(crate) fn floor(x: f64) -> f64 {
+    #[cfg(feature = "std")]
+    {
+        x.floor()
+    }
+    #[cfg(not(feature = "std"))]
+    {
+        libm::floor(x)
+    }
+}
+
 /// Euclidean modulo with a positive result for positive `rhs`.
 ///
 /// `f64::rem_euclid` is std-only; this mirrors kurbo's internal fallback.

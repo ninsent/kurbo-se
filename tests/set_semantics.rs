@@ -157,6 +157,25 @@ fn donut_hole_and_saturation() {
     check("donut", &d, 100.0, 48); // ring thinner than w: whole ring
 }
 
+/// The two inward offsets of the donut coincide at exactly half the ring
+/// thickness ((100 − 45) / 2 = 27.5), where the erosion is measure-zero.
+/// Just below, a thin annulus must survive; at and beyond, the ring
+/// saturates — through the degeneracy, the set contract must hold.
+#[test]
+fn donut_offset_coincidence() {
+    let d = donut();
+    check("donut", &d, 27.4, 48);
+    check("donut", &d, 27.5, 48);
+    check("donut", &d, 27.6, 48);
+}
+
+/// The inside offset of a circle collapses to a point at exactly w = r.
+#[test]
+fn circle_collapse_at_radius() {
+    let c = Circle::new((120.0, 120.0), 70.0).to_path(1e-7);
+    check("circle", &c, 70.0, 48);
+}
+
 #[test]
 fn thin_wedge() {
     let w = wedge();

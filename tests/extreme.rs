@@ -235,6 +235,152 @@ fn open_loop_curve_no_cancellation() {
     }
 }
 
+/// Degenerate-width regression (sandbox session, 2026-08-20): at the exact
+/// width where an offset degenerates, the pipeline used to shred it into
+/// thousands of fuzz segments (donut at half its ring thickness) or spend
+/// over 100 ms cutting a collapsed offset cluster (circle at w = r). The
+/// output must stay small and correctly saturated.
+#[test]
+fn degenerate_widths_stay_bounded() {
+    // Donut at exactly half the ring thickness: inward offsets coincide.
+    let mut donut = Circle::new((130.0, 130.0), 100.0).to_path(1e-6);
+    donut.extend(
+        Circle::new((130.0, 130.0), 45.0)
+            .to_path(1e-6)
+            .reverse_subpaths()
+            .iter(),
+    );
+    let style = StrokeStyle::new(27.5).with_alignment(StrokeAlignment::Inside);
+    let out = stroke_aligned(&donut, &style, 0.01);
+    assert!(out.is_finite());
+    assert!(
+        out.segments().count() < 200,
+        "coincident offsets shredded into {} segments",
+        out.segments().count()
+    );
+    // The ring saturates: mid-ring points are painted, the hole stays clean.
+    assert!(
+        out.winding((130.0 + 72.5, 130.0).into()) != 0,
+        "ring not covered"
+    );
+    assert_eq!(out.winding((130.0, 130.0).into()), 0, "hole painted");
+
+    // Circle at w = r: the inside offset collapses to a point.
+    let circle = Circle::new((120.0, 120.0), 80.0).to_path(1e-6);
+    let style = StrokeStyle::new(80.0).with_alignment(StrokeAlignment::Inside);
+    let out = stroke_aligned(&circle, &style, 0.01);
+    assert!(out.is_finite());
+    assert!(
+        out.segments().count() < 100,
+        "collapsed offset leaked {} segments",
+        out.segments().count()
+    );
+    // Saturated: the whole disc is painted.
+    assert!(
+        out.winding((120.0, 120.0).into()) != 0,
+        "center not painted"
+    );
+    assert!(
+        out.winding((120.0 + 79.0, 120.0).into()) != 0,
+        "rim not painted"
+    );
+}
+
+/// The sandbox "Multi-subpath mixed" gallery shape: an open polyline above
+/// a rect and a reversed circle.
+fn mixed_shape() -> BezPath {
+    let mut p = BezPath::new();
+    p.move_to((20.0, 40.0));
+    p.line_to((120.0, 20.0));
+    p.line_to((220.0, 40.0));
+    p.extend(Rect::new(40.0, 80.0, 120.0, 140.0).to_path(1e-9).iter());
+    p.extend(
+        Circle::new((190.0, 110.0), 35.0)
+            .to_path(1e-6)
+            .reverse_subpaths()
+            .iter(),
+    );
+    p
+}
+
+/// Every fill-interior cell must stay unpainted by an outside stroke.
+fn assert_outside_avoids_fill(out: &BezPath, src: &BezPath, bbox: Rect, n: usize, label: &str) {
+    for iy in 0..n {
+        for ix in 0..n {
+            let p = Point::new(
+                bbox.x0 + (ix as f64 + 0.5) / n as f64 * bbox.width(),
+                bbox.y0 + (iy as f64 + 0.5) / n as f64 * bbox.height(),
+            );
+            if src.winding(p) != 0 {
+                assert_eq!(
+                    out.winding(p),
+                    0,
+                    "{label}: outside stroke inside fill at {p:?}"
+                );
+            }
+        }
+    }
+}
+
+/// Outside stroke on a mixed open+closed path (2026-08-20 report): the open
+/// polyline must not take part in the closed contours' region construction.
+/// Previously its proximity pruned chunks out of the rect/circle dilations
+/// at weights above ~24, and the stitch bridged the holes with chords
+/// across the fill.
+#[test]
+fn mixed_open_closed_outside_extreme() {
+    let p = mixed_shape();
+    for join in [kurbo::Join::Round, kurbo::Join::Miter, kurbo::Join::Bevel] {
+        for w in [11.0, 21.0, 25.5, 30.0, 44.0, 47.0, 60.0] {
+            let style = StrokeStyle::new(w)
+                .with_alignment(StrokeAlignment::Outside)
+                .with_join(join);
+            let out = stroke_aligned(&p, &style, 1e-3);
+            assert!(out.is_finite());
+            // Outside stroke never enters any fill — dense grids over both
+            // closed shapes (the miter-wedge bug painted a vertical strip
+            // through the circle's left half).
+            assert_outside_avoids_fill(
+                &out,
+                &p,
+                Rect::new(40.0, 80.0, 120.0, 140.0),
+                24,
+                &format!("rect {join:?} w={w}"),
+            );
+            assert_outside_avoids_fill(
+                &out,
+                &p,
+                Rect::new(155.0, 75.0, 225.0, 145.0),
+                24,
+                &format!("circle {join:?} w={w}"),
+            );
+            // The ring must hug the rect's top-left corner outward — the
+            // corner nearest the roof polyline, where the open-path pruning
+            // used to carve it off. Diagonal reach depends on the join:
+            // bevel chords stop at w/√2, round at w, miter at w·√2.
+            let factor = if join == kurbo::Join::Bevel {
+                0.55
+            } else {
+                0.9
+            };
+            let d = w / core::f64::consts::SQRT_2 * factor;
+            let probe = Point::new(40.0 - d, 80.0 - d);
+            assert!(
+                out.winding(probe) != 0,
+                "rect corner ring missing {join:?} w={w} ({probe:?})"
+            );
+            // Once the two dilations overlap (gap is 35), the merged band
+            // must cover the midpoint between the shapes.
+            if w > 20.0 {
+                assert!(
+                    out.winding((137.5, 110.0).into()) != 0,
+                    "merged band has a gap {join:?} w={w}"
+                );
+            }
+        }
+    }
+}
+
 /// Figure-eight is now handled by lobe splitting: inside stays inside the
 /// fill of both lobes (previously a documented limitation).
 #[test]

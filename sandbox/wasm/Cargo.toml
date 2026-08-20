@@ -15,3 +15,9 @@ serde_json = "1"
 
 [profile.release]
 opt-level = "s"
+
+# The dev server builds with `wasm-pack --dev` for fast rebuilds; without
+# optimization the geometry hot loops run ~20x slower and the sandbox feels
+# laggy. opt-level 2 keeps rebuilds quick and interaction smooth.
+[profile.dev]
+opt-level = 2

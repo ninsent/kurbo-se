@@ -271,9 +271,22 @@ pub fn stroke_aligned_with<'a>(
                 fill_side: StrokeSide::Right,
             })
             .collect();
+        // The region's predicates must see only the contours participating
+        // in it: an open subpath is banded separately (its one-sided band is
+        // not a distance set), so its proximity must not prune the region
+        // boundary, and its implicit closing chord must not shape the fill.
+        // For all-closed paths this equals the whole input (up to
+        // orientation, which neither predicate observes).
+        let mut region_source = BezPath::new();
+        for els in &normalized {
+            region_source.extend(els.iter());
+        }
         // Flatten the source once for the distance predicate, finely enough
         // not to eat into the pruning slack.
-        let index = crate::region::SourceIndex::new(input, (width_eff * 1e-3).max(tolerance * 0.1));
+        let index = crate::region::SourceIndex::new(
+            &region_source,
+            (width_eff * 1e-3).max(tolerance * 0.1),
+        );
         let base = BandParams {
             d_left: 0.0,
             d_right: 0.0,

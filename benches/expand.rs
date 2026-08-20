@@ -38,10 +38,22 @@ fn star() -> BezPath {
     p
 }
 
+fn donut() -> BezPath {
+    let mut p = Circle::new((130.0, 130.0), 100.0).to_path(1e-9);
+    p.extend(
+        Circle::new((130.0, 130.0), 45.0)
+            .to_path(1e-9)
+            .reverse_subpaths()
+            .iter(),
+    );
+    p
+}
+
 fn bench_expand(c: &mut Criterion) {
     let circle = Circle::new((100.0, 100.0), 50.0).to_path(1e-9);
     let wavy40 = wavy(40);
     let star = star();
+    let donut = donut();
     let tol = 0.25; // display tolerance
 
     let solid_inside = StrokeStyle::new(8.0).with_alignment(StrokeAlignment::Inside);
@@ -62,6 +74,10 @@ fn bench_expand(c: &mut Criterion) {
     });
     g.bench_function("star/inside/solid", |b| {
         b.iter(|| black_box(stroke_aligned(black_box(&star), &solid_inside, tol)));
+    });
+    // Two contours through the region pipeline (hole-aware erosion).
+    g.bench_function("donut/inside/solid", |b| {
+        b.iter(|| black_box(stroke_aligned(black_box(&donut), &solid_inside, tol)));
     });
     g.bench_function("wavy40/inside/solid", |b| {
         b.iter(|| black_box(stroke_aligned(black_box(&wavy40), &solid_inside, tol)));

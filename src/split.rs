@@ -27,7 +27,13 @@ use alloc::vec::Vec;
 use kurbo::{BezPath, ParamCurve, ParamCurveArclen, ParamCurveExtrema, PathEl, PathSeg, Point};
 
 /// Parametric epsilon for treating a hit as an endpoint touch.
-const T_EPS: f64 = 1e-6;
+pub(crate) const T_EPS: f64 = 1e-6;
+
+/// Parametric margin trimmed off shared endpoints of adjacent segments
+/// before intersecting them. A smooth joint then rejects at the bounding-box
+/// level instead of recursing to flatness; cuts this close to a joint are
+/// redundant anyway (segment boundaries are already piece boundaries).
+const ADJ_TRIM: f64 = 1e-3;
 /// Cluster radius for deduplicating hits, in parameter space.
 const DEDUP_EPS: f64 = 1e-4;
 /// Arc-length accuracy for dash phase offsets.
@@ -102,9 +108,6 @@ pub(crate) fn split_self_intersections(
             push_crossing(&mut cuts, (i, t1), (i, t2));
         }
         for j in (i + 1)..n {
-            // Adjacent segments share an endpoint; trim it off so smooth
-            // joints reject at the bounding-box level instead of recursing
-            // to flatness (a large constant cost on curved paths).
             let adjacent_next = j == i + 1;
             let adjacent_wrap = closed && i == 0 && j == n - 1;
             let (ba, bb) = (bboxes[i], bboxes[j]);
@@ -115,16 +118,9 @@ pub(crate) fn split_self_intersections(
             {
                 continue;
             }
-            let hits = seg_pair_intersections(&segs[i], &segs[j], accuracy);
-            let _ = (adjacent_next, adjacent_wrap);
+            let hits =
+                segment_pair_params(&segs[i], &segs[j], adjacent_next, adjacent_wrap, accuracy);
             for (ta, tb) in hits {
-                // Endpoint touches between neighbors are joints, not crossings.
-                if j == i + 1 && ta > 1.0 - T_EPS && tb < T_EPS {
-                    continue;
-                }
-                if closed && i == 0 && j == n - 1 && ta < T_EPS && tb > 1.0 - T_EPS {
-                    continue;
-                }
                 // Mutual endpoint touches are handled by the duplicate-vertex
                 // pass below (once, instead of once per incident pair).
                 let a_end = !(T_EPS..=1.0 - T_EPS).contains(&ta);
@@ -330,21 +326,38 @@ pub(crate) fn segment_self_intersection_params(seg: &PathSeg, accuracy: f64) -> 
     out
 }
 
-/// Intersection parameters of two segments. `adjacent` trims the shared
-/// endpoint so a smooth joint is not reported as a crossing.
+/// Intersection parameters of two segments.
+///
+/// `next` marks `end(a) = start(b)` adjacency, `wrap` marks
+/// `start(a) = end(b)` (the seam pair of a closed contour); both can hold at
+/// once for a two-segment contour. The shared endpoints are trimmed off the
+/// search domain ([`ADJ_TRIM`]), so a smooth joint costs one bounding-box
+/// rejection instead of a recursion to flatness, and the joint itself is
+/// never reported as a crossing.
 pub(crate) fn segment_pair_params(
     a: &PathSeg,
     b: &PathSeg,
-    adjacent: bool,
+    next: bool,
+    wrap: bool,
     accuracy: f64,
 ) -> Vec<(f64, f64)> {
-    let mut hits = seg_pair_intersections(a, b, accuracy);
-    if adjacent {
-        // Drop the shared endpoint itself; it is a joint, not a crossing.
-        const TRIM: f64 = 1e-3;
-        hits.retain(|(ta, tb)| *ta < 1.0 - TRIM || *tb > TRIM);
-        hits.retain(|(ta, tb)| ta.min(1.0 - *ta) > TRIM || tb.min(1.0 - *tb) > TRIM);
+    let ar = (
+        if wrap { ADJ_TRIM } else { 0.0 },
+        if next { 1.0 - ADJ_TRIM } else { 1.0 },
+    );
+    let br = (
+        if next { ADJ_TRIM } else { 0.0 },
+        if wrap { 1.0 - ADJ_TRIM } else { 1.0 },
+    );
+    let mut hits = Vec::new();
+    if next || wrap {
+        let a_sub = a.subsegment(ar.0..ar.1);
+        let b_sub = b.subsegment(br.0..br.1);
+        recurse(&a_sub, ar, &b_sub, br, accuracy.max(1e-9), 0, &mut hits);
+    } else {
+        recurse(a, ar, b, br, accuracy.max(1e-9), 0, &mut hits);
     }
+    dedupe(&mut hits);
     hits
 }
 
@@ -402,25 +415,10 @@ fn point_line_dist(p: Point, a: Point, b: Point) -> f64 {
     ((p - a).cross(d)).abs() / crate::math::sqrt(len2)
 }
 
-/// Intersections between two distinct segments, by box subdivision.
-fn seg_pair_intersections(a: &PathSeg, b: &PathSeg, accuracy: f64) -> Vec<(f64, f64)> {
-    let mut hits = Vec::new();
-    recurse(
-        a,
-        (0.0, 1.0),
-        b,
-        (0.0, 1.0),
-        accuracy.max(1e-9),
-        0,
-        &mut hits,
-    );
-    dedupe(&mut hits);
-    hits
-}
-
 /// Self-intersections of one segment (cubic loops): split at the curve's
 /// extrema — monotone pieces cannot self-intersect — and intersect the
-/// pieces pairwise.
+/// pieces pairwise. Adjacent pieces get their shared endpoint trimmed off
+/// the domain (same rationale as [`segment_pair_params`]).
 fn seg_self_intersections(seg: &PathSeg, accuracy: f64) -> Vec<(f64, f64)> {
     if !matches!(seg, PathSeg::Cubic(_)) {
         return Vec::new();
@@ -438,11 +436,15 @@ fn seg_self_intersections(seg: &PathSeg, accuracy: f64) -> Vec<(f64, f64)> {
     let mut hits = Vec::new();
     for i in 0..bounds.len() - 1 {
         for j in (i + 1)..bounds.len() - 1 {
-            let (a0, a1) = (bounds[i], bounds[i + 1]);
-            let (b0, b1) = (bounds[j], bounds[j + 1]);
+            let (a0, mut a1) = (bounds[i], bounds[i + 1]);
+            let (mut b0, b1) = (bounds[j], bounds[j + 1]);
+            if j == i + 1 {
+                // Trim the shared endpoint out of the search domain.
+                a1 -= ADJ_TRIM * (a1 - a0);
+                b0 += ADJ_TRIM * (b1 - b0);
+            }
             let pa = seg.subsegment(a0..a1);
             let pb = seg.subsegment(b0..b1);
-            let mut local = Vec::new();
             recurse(
                 &pa,
                 (a0, a1),
@@ -450,15 +452,8 @@ fn seg_self_intersections(seg: &PathSeg, accuracy: f64) -> Vec<(f64, f64)> {
                 (b0, b1),
                 accuracy.max(1e-9),
                 0,
-                &mut local,
+                &mut hits,
             );
-            for (ta, tb) in local {
-                // Adjacent pieces share an endpoint; ignore that touch.
-                if j == i + 1 && ta > a1 - T_EPS && tb < b0 + T_EPS {
-                    continue;
-                }
-                hits.push((ta, tb));
-            }
         }
     }
     dedupe(&mut hits);
