@@ -1,0 +1,9 @@
+/target
+/examples/vello-demo/target
+/examples/vello-demo/vello-demo.png
+/sandbox/node_modules
+/sandbox/dist
+/sandbox/wasm/pkg
+/sandbox/wasm/target
+Cargo.lock
+!/examples/vello-demo/Cargo.lock

@@ -1,0 +1,13 @@
+[package]
+name = "kurbo-se-vello-demo"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+kurbo-se = { path = "../.." }
+vello = "0.10"
+pollster = "0.4"
+png = "0.18"
+
+[workspace]

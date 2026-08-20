@@ -1,0 +1,150 @@
+:root {
+  --bg: #16181d;
+  --panel: #1e2128;
+  --line: #2c313a;
+  --text: #d7dae0;
+  --muted: #8b919c;
+  --accent: #6ea8fe;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  display: flex;
+  height: 100vh;
+  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+#panel {
+  width: 300px;
+  min-width: 300px;
+  overflow-y: auto;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  padding: 12px 14px 40px;
+}
+
+#panel h1 {
+  font-size: 14px;
+  margin: 2px 0 10px;
+}
+#panel h1 span {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.group {
+  border-top: 1px solid var(--line);
+  padding: 10px 0;
+}
+.group > .title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+}
+.row label {
+  flex: 0 0 84px;
+  color: var(--muted);
+}
+.row input[type="range"] {
+  flex: 1;
+  accent-color: var(--accent);
+}
+.row input[type="number"] {
+  width: 64px;
+}
+.row select {
+  flex: 1;
+}
+
+input[type="number"],
+select {
+  background: #14161b;
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  padding: 3px 6px;
+}
+
+.seg {
+  display: flex;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  flex: 1;
+}
+.seg button {
+  flex: 1;
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  padding: 5px 0;
+  cursor: pointer;
+  font: inherit;
+}
+.seg button.on {
+  background: var(--accent);
+  color: #10131a;
+}
+
+.checks label {
+  display: flex;
+  gap: 7px;
+  align-items: center;
+  margin: 4px 0;
+  color: var(--text);
+  cursor: pointer;
+}
+.checks input {
+  accent-color: var(--accent);
+}
+
+#stage {
+  flex: 1;
+  position: relative;
+}
+#canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+}
+#canvas:active {
+  cursor: grabbing;
+}
+
+#stats {
+  position: absolute;
+  right: 10px;
+  top: 10px;
+  background: rgba(20, 22, 27, 0.88);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 12px;
+  font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  pointer-events: none;
+  white-space: pre;
+}
+#stats b {
+  color: var(--text);
+}
+
+.err {
+  color: #ff8484;
+}

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>kurbo-se sandbox</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <aside id="panel"></aside>
+    <main id="stage">
+      <svg id="canvas" xmlns="http://www.w3.org/2000/svg">
+        <g id="layer-fill"></g>
+        <g id="layer-ref"></g>
+        <g id="layer-wire"></g>
+        <g id="layer-src"></g>
+        <g id="layer-dir"></g>
+        <g id="layer-joins"></g>
+      </svg>
+      <div id="stats"></div>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "name": "kurbo-se-sandbox",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "wasm": "wasm-pack build wasm --target web --dev --out-dir pkg"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "typescript": "^5.6.0",
+    "vite": "^6.0.0"
+  }
+}
