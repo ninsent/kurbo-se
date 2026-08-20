@@ -24,7 +24,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use kurbo::{BezPath, ParamCurve, ParamCurveArclen, ParamCurveExtrema, PathEl, PathSeg, Point};
+use kurbo::{BezPath, ParamCurve, ParamCurveExtrema, PathEl, PathSeg, Point};
 
 /// Parametric epsilon for treating a hit as an endpoint touch.
 pub(crate) const T_EPS: f64 = 1e-6;
@@ -69,7 +69,12 @@ pub(crate) fn split_self_intersections(
     closed: bool,
     accuracy: f64,
 ) -> Option<SplitResult> {
-    let segs: Vec<PathSeg> = kurbo::segments(subpath.iter().copied()).collect();
+    // Degenerate segments carry no geometry, but their endpoints coincide
+    // with their neighbours' — the duplicate-vertex pass below would read a
+    // run of them as the path revisiting a point and split there.
+    let segs: Vec<PathSeg> = kurbo::segments(subpath.iter().copied())
+        .filter(|s| !is_degenerate(s))
+        .collect();
     let n = segs.len();
     if n == 0 {
         return None;
@@ -176,7 +181,7 @@ pub(crate) fn split_self_intersections(
     let mut s = 0.0;
     let mut cut_ix = 0;
     for (i, seg) in segs.iter().enumerate() {
-        let seg_len = seg.arclen(ARCLEN_ACC);
+        let seg_len = crate::math::arclen(seg, ARCLEN_ACC);
         let mut t0 = 0.0;
         while cut_ix < cuts.len() && cuts[cut_ix].seg == i {
             let c = &cuts[cut_ix];
@@ -375,6 +380,26 @@ pub(crate) fn subdivide_at(seg: &PathSeg, ts: &mut Vec<f64>) -> Vec<PathSeg> {
     }
     out.push(seg.subsegment(t0..1.0));
     out
+}
+
+/// Whether a segment covers no distance.
+///
+/// Vanishing *squared* length, not exact coincidence: control deltas small
+/// enough that their squared length underflows to zero make kurbo's
+/// closed-form quad arc length divide zero by zero and return `NaN`, which
+/// then poisons every arc-length accumulator downstream — dash phases become
+/// `NaN` and the output goes non-finite. Such a segment carries no length
+/// either way, so both cases are dropped together.
+pub(crate) fn is_degenerate(seg: &PathSeg) -> bool {
+    match seg {
+        PathSeg::Line(l) => (l.p1 - l.p0).hypot2() == 0.0,
+        PathSeg::Quad(q) => (q.p1 - q.p0).hypot2() == 0.0 && (q.p2 - q.p1).hypot2() == 0.0,
+        PathSeg::Cubic(c) => {
+            (c.p1 - c.p0).hypot2() == 0.0
+                && (c.p2 - c.p1).hypot2() == 0.0
+                && (c.p3 - c.p2).hypot2() == 0.0
+        }
+    }
 }
 
 fn start_point(subpath: &[PathEl]) -> Point {

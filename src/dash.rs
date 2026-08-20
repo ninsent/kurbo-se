@@ -18,9 +18,20 @@ use kurbo::{
     BezPath, Cap, ParamCurve, ParamCurveArclen, ParamCurveDeriv, PathEl, Point, Shape as _, Vec2,
 };
 
+use crate::clip::ClipSource;
 use crate::expand::{Band, BandParams};
 use crate::math;
 use crate::style::DashStyle;
+
+/// How a dash band is masked by the fill (see [`crate::clip`]).
+#[derive(Copy, Clone)]
+pub(crate) struct DashClip<'a> {
+    pub source: &'a ClipSource,
+    /// `true` for inside alignment (keep the part in the fill), `false` for
+    /// outside (keep the part outside it).
+    pub keep_inside: bool,
+    pub accuracy: f64,
+}
 
 /// Arc-length accuracy, matching kurbo's internal `DASH_ACCURACY`.
 const DASH_ACCURACY: f64 = 1e-6;
@@ -91,10 +102,12 @@ pub(crate) fn expand_dashed_subpath(
     phase_shift: f64,
     true_start: Option<Point>,
     true_end: Option<Point>,
+    clip: Option<DashClip<'_>>,
     group: &mut Vec<PathEl>,
     left: &mut BezPath,
     right: &mut BezPath,
     scratch: &mut BezPath,
+    band_buf: &mut BezPath,
     out: &mut BezPath,
 ) {
     let offset = dash.offset - phase_shift;
@@ -106,10 +119,18 @@ pub(crate) fn expand_dashed_subpath(
     // groups are dropped in favor of the synthesized dot at that position.
     let mut tiny_group_threshold = 0.0;
     if dash.has_zero_dashes && dash.cap != Cap::Butt {
-        let total: f64 = kurbo::segments(subpath.iter().copied())
-            .map(|seg| seg.arclen(DASH_ACCURACY))
+        let total: f64 = kurbo::segments(non_degenerate(subpath))
+            .map(|seg| math::arclen(&seg, DASH_ACCURACY))
             .sum();
-        synthesize_dots(subpath, closed, dash, &params, offset, total, out);
+        match clip {
+            Some(c) => {
+                band_buf.truncate(0);
+                synthesize_dots(subpath, closed, dash, &params, offset, total, band_buf);
+                crate::clip::clip_band(band_buf, c.source, c.keep_inside, c.accuracy, out);
+                band_buf.truncate(0);
+            }
+            None => synthesize_dots(subpath, closed, dash, &params, offset, total, out),
+        }
         tiny_group_threshold = 1e-6 * total.max(1.0);
     }
 
@@ -147,19 +168,65 @@ pub(crate) fn expand_dashed_subpath(
                 dash.cap
             };
         }
-        let mut band = Band::new(p, left, right, scratch, out);
-        band.run(group.iter().copied());
+        match clip {
+            // Expand into a scratch buffer so the mask sees one dash at a
+            // time, then intersect it with (or subtract it from) the fill.
+            Some(c) => {
+                band_buf.truncate(0);
+                {
+                    let mut band = Band::new(p, left, right, scratch, band_buf);
+                    band.run(group.iter().copied());
+                }
+                crate::clip::clip_band(band_buf, c.source, c.keep_inside, c.accuracy, out);
+                band_buf.truncate(0);
+            }
+            None => {
+                let mut band = Band::new(p, left, right, scratch, out);
+                band.run(group.iter().copied());
+            }
+        }
         group.clear();
     };
 
     group.clear();
-    for el in kurbo::dash(subpath.iter().copied(), offset, dash.pattern) {
+    for el in kurbo::dash(non_degenerate(subpath), offset, dash.pattern) {
         if matches!(el, PathEl::MoveTo(_)) {
             flush(group);
         }
         group.push(el);
     }
     flush(group);
+}
+
+/// Drop drawing elements that cover no distance.
+///
+/// [`kurbo::dash`] walks the element stream by arc length. A zero-length
+/// quad or cubic carries no direction and its arc-length inverse is
+/// degenerate, which stalls the pattern phase: everything past such an
+/// element comes back as one uninterrupted dash. Filtering them out first is
+/// free — the band expansion skips them anyway — and keeps the dash lengths
+/// and the phase exactly as they would be on the cleaned path.
+fn non_degenerate(els: &[PathEl]) -> impl Iterator<Item = PathEl> + '_ {
+    use kurbo::{CubicBez, Line, PathSeg, QuadBez};
+    let mut cur: Option<Point> = None;
+    els.iter().copied().filter(move |el| {
+        let keep = match (cur, el) {
+            (Some(p0), PathEl::LineTo(p)) => {
+                !crate::split::is_degenerate(&PathSeg::Line(Line::new(p0, *p)))
+            }
+            (Some(p0), PathEl::QuadTo(p1, p2)) => {
+                !crate::split::is_degenerate(&PathSeg::Quad(QuadBez::new(p0, *p1, *p2)))
+            }
+            (Some(p0), PathEl::CurveTo(p1, p2, p3)) => {
+                !crate::split::is_degenerate(&PathSeg::Cubic(CubicBez::new(p0, *p1, *p2, *p3)))
+            }
+            _ => true,
+        };
+        if let Some(p) = el.end_point() {
+            cur = Some(p);
+        }
+        keep
+    })
 }
 
 /// Total straight-line length of a dash group's elements (cheap lower bound
@@ -240,11 +307,11 @@ fn synthesize_dots(
     let mid_shift = 0.5 * (params.d_right - params.d_left);
     let mut pos_ix = 0;
     let mut acc = 0.0;
-    for seg in kurbo::segments(subpath.iter().copied()) {
+    for seg in kurbo::segments(non_degenerate(subpath)) {
         if pos_ix >= positions.len() {
             break;
         }
-        let len = seg.arclen(DASH_ACCURACY);
+        let len = math::arclen(&seg, DASH_ACCURACY);
         while pos_ix < positions.len() {
             let s = positions[pos_ix];
             if s > acc + len && !(s >= total && acc + len >= total) {

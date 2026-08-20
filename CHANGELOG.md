@@ -37,6 +37,44 @@ This changelog follows <https://keepachangelog.com/en/>.
 
 ### Fixed
 
+- Dashing stopped partway along paths containing degenerate segments: a
+  fully coincident `QuadTo` has a `NaN` arc length upstream
+  (`QuadBez::arclen`), which poisoned the dash phase so everything past that
+  element rendered as one uninterrupted band. Segments whose squared length
+  vanishes — including control deltas too small to square without
+  underflowing, which are *not* point-coincident and used to make the whole
+  output non-finite — are now dropped before dashing and before
+  self-intersection splitting, where runs of them also read as the path
+  revisiting a vertex and split dashes for no reason. Arc-length reads are
+  additionally guarded so an unmeasurable (overflow-scale) segment cannot
+  stall the phase. Reported upstream as
+  [`upstream/04-quad-arclen-nan.md`](upstream/04-quad-arclen-nan.md).
+- Square dash caps on curved contours shattered each dash into a wedge plus
+  a sliver. The cap overshoots the fill on a convex curve, so the mask runs;
+  a fill-boundary piece that straddled the end of the band's shared edge was
+  discarded whole as coincident, stranding that edge as its own loop. The
+  fill boundary is now also cut at the ends of the shared edge, so every
+  piece is either wholly coincident with it or wholly free.
+- Extreme inside weights on a star punched a hole in the middle of an
+  otherwise saturated shape (weights ~79–95 failed while 60 and 100 were
+  fine). The distance prune exempted outer-side join geometry outright, so
+  at large widths the enormous join fans at the star's reflex corners
+  survived inside the fill and stitched into a bogus erosion loop. The
+  exemption is now bounded — a bevel chord may come within `cos(φ/2)·w` of
+  its corner, round joins and miters not at all — and applies only to the
+  dilation, where corner-cutting is the requested style and nothing folds
+  inward. For the erosion the distance test is the saturation guard and
+  stays strict; dropping a bevel chord there costs nothing, since the
+  stitcher bridges the gap with the same chord.
+- Dashed inside/outside strokes are now masked by the fill. A dash is banded
+  directly — the region construction cannot be used once the contour is cut
+  into dashes — so a band that did not fit the local geometry escaped: a dash
+  starting at a star's tip sat mostly outside the shape, and dashes beside
+  the bowtie's crossing reached into the neighbouring lobe's fill. Each dash
+  (and synthesized dot) is now intersected with the fill, or subtracted from
+  it for outside alignment. The mask is skipped where the excursion is below
+  `tolerance`, so display-tolerance dashing keeps its speed; a dashed circle
+  costs ~55 µs against ~31 µs before.
 - Inside/outside strokes on paths mixing open and closed subpaths: the open
   subpaths' geometry took part in the region predicates (distance pruning
   and implicit-closure winding), so at larger widths a nearby open polyline
@@ -69,7 +107,6 @@ This changelog follows <https://keepachangelog.com/en/>.
 - Sandbox: the dev server's wasm now builds with `opt-level = 2` and
   `npm run build` uses `wasm-pack --release` (both previously unoptimized
   `--dev`, the dominant cause of sandbox lag).
-
 - `no_std` (`libm`) build: the `y`-bucket lookups in the source index called
   the std-only `f64::floor`/`f64::ceil` inherent methods; they now go through
   the crate's float shims. Caught by the CI `no-std` job.

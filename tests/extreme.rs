@@ -381,6 +381,151 @@ fn mixed_open_closed_outside_extreme() {
     }
 }
 
+/// Saturation is monotone in the weight (2026-08-21 report): once the band
+/// covers the shape, every larger weight must keep covering it — no holes
+/// reappearing, no leaks outside.
+///
+/// The star regressed here at w ≈ 79–95 while 60 and 100 were fine: the
+/// distance prune exempted join geometry outright, so at extreme widths the
+/// enormous join fans at the star's reflex corners survived inside the fill
+/// and stitched into a bogus erosion loop. The exemption is now bounded by
+/// the join's real reach (`cos(φ/2)` for a bevel chord).
+#[test]
+fn extreme_inside_saturation_is_monotone() {
+    let mut star = BezPath::new();
+    for i in 0..10 {
+        let r = if i % 2 == 0 { 100.0 } else { 40.0 };
+        let a = std::f64::consts::PI * (i as f64) / 5.0 - std::f64::consts::FRAC_PI_2;
+        let pt = (150.0 + r * a.cos(), 150.0 + r * a.sin());
+        if i == 0 {
+            star.move_to(pt);
+        } else {
+            star.line_to(pt);
+        }
+    }
+    star.close_path();
+
+    let mut wedge = BezPath::new();
+    wedge.move_to((20.0, 180.0));
+    wedge.line_to((230.0, 160.0));
+    wedge.line_to((20.0, 140.0));
+    wedge.close_path();
+
+    let rect = Rect::new(40.0, 80.0, 160.0, 140.0).to_path(1e-9);
+    let circle = Circle::new((150.0, 150.0), 100.0).to_path(1e-6);
+
+    // Past these weights each shape is fully within reach of its own
+    // boundary, so the inside stroke must paint it solid.
+    for (name, src, saturated_at) in [
+        ("star", &star, 40.0),
+        ("wedge", &wedge, 25.0),
+        ("rect", &rect, 35.0),
+        ("circle", &circle, 105.0),
+    ] {
+        for join in [kurbo::Join::Miter, kurbo::Join::Round, kurbo::Join::Bevel] {
+            for w in [
+                saturated_at,
+                saturated_at * 1.5,
+                79.0_f64.max(saturated_at),
+                85.0_f64.max(saturated_at),
+                95.0_f64.max(saturated_at),
+                saturated_at * 4.0,
+                saturated_at * 20.0,
+            ] {
+                let style = StrokeStyle::new(w)
+                    .with_alignment(StrokeAlignment::Inside)
+                    .with_join(join);
+                let out = stroke_aligned(src, &style, 1e-3);
+                assert!(out.is_finite(), "{name}/{join:?}/w{w}: non-finite");
+                let bbox = src.bounding_box().inflate(8.0, 8.0);
+                grid_check(&out, src, bbox, 96, |_, in_out, in_src| {
+                    if in_out && !in_src {
+                        return Err("saturated stroke leaked outside the shape");
+                    }
+                    if in_src && !in_out {
+                        return Err("saturated stroke left a hole");
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+}
+
+/// Dashed one-sided strokes are masked by the fill (2026-08-21 report).
+///
+/// A dash is banded directly — the region construction cannot be used once
+/// the contour is cut into dashes — so a band that does not fit the local
+/// geometry used to escape: a dash starting at a star tip (where the wedge
+/// is far thinner than the weight) sat mostly outside the shape, and dashes
+/// near the bowtie's crossing reached into the neighbouring lobe's fill.
+#[test]
+fn dashed_one_sided_stays_masked() {
+    let mut star = BezPath::new();
+    for i in 0..10 {
+        let r = if i % 2 == 0 { 100.0 } else { 40.0 };
+        let a = std::f64::consts::PI * (i as f64) / 5.0 - std::f64::consts::FRAC_PI_2;
+        let pt = (150.0 + r * a.cos(), 150.0 + r * a.sin());
+        if i == 0 {
+            star.move_to(pt);
+        } else {
+            star.line_to(pt);
+        }
+    }
+    star.close_path();
+
+    let mut bowtie = BezPath::new();
+    bowtie.move_to((20.0, 20.0));
+    bowtie.line_to((220.0, 180.0));
+    bowtie.line_to((220.0, 20.0));
+    bowtie.line_to((20.0, 180.0));
+    bowtie.close_path();
+
+    let circle = Circle::new((150.0, 150.0), 100.0).to_path(1e-6);
+
+    for (name, src) in [("star", &star), ("bowtie", &bowtie), ("circle", &circle)] {
+        for cap in [
+            kurbo_se::Cap::Round,
+            kurbo_se::Cap::Butt,
+            kurbo_se::Cap::Square,
+        ] {
+            for (alignment, inside) in [
+                (StrokeAlignment::Inside, true),
+                (StrokeAlignment::Outside, false),
+            ] {
+                // Two phases: the reported one, plus a shift that lands dash
+                // ends elsewhere on the corners.
+                for offset in [-39.0, 0.0, 7.5] {
+                    let style = StrokeStyle::new(10.0).with_alignment(alignment).with_dash(
+                        kurbo_se::DashStyle::from_pattern([20.0, 29.0])
+                            .with_offset(offset)
+                            .with_cap(cap),
+                    );
+                    let out = stroke_aligned(src, &style, 1e-3);
+                    assert!(out.is_finite(), "{name}/{alignment:?}/{cap:?} non-finite");
+                    let label = format!("{name}/{alignment:?}/{cap:?}/off{offset}");
+                    let bbox = src.bounding_box().inflate(20.0, 20.0);
+                    grid_check(&out, src, bbox, 96, |_, in_out, in_src| {
+                        if inside && in_out && !in_src {
+                            return Err("dashed inside stroke left the fill");
+                        }
+                        if !inside && in_out && in_src {
+                            return Err("dashed outside stroke entered the fill");
+                        }
+                        Ok(())
+                    });
+                    // The mask must trim, not erase: dashes still paint.
+                    assert!(
+                        out.area().abs() > 500.0,
+                        "{label}: dashes vanished (area {})",
+                        out.area().abs()
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Figure-eight is now handled by lobe splitting: inside stays inside the
 /// fill of both lobes (previously a documented limitation).
 #[test]

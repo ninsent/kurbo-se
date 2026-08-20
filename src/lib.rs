@@ -46,7 +46,8 @@
 //! Two consequences are worth stating outright:
 //!
 //! - an inside stroke **never** leaves the fill and an outside stroke never
-//!   enters it, at any width;
+//!   enters it, at any width — dashed strokes included, where each dash is
+//!   expanded and then masked by the fill;
 //! - a width beyond the local thickness **saturates** instead of folding
 //!   over itself — the stroke fills the shape completely, exactly as Figma
 //!   renders it (a rectangle narrower than `2w`, a thin wedge, a small star).
@@ -93,6 +94,7 @@ extern crate alloc;
 
 pub use kurbo;
 
+mod clip;
 mod ctx;
 mod dash;
 mod expand;

@@ -103,6 +103,26 @@ pub(crate) fn rem_euclid(x: f64, rhs: f64) -> f64 {
     if r < 0.0 { r + abs(rhs) } else { r }
 }
 
+/// Arc length of a path segment, guarded against non-finite results.
+///
+/// `QuadBez::arclen` has a closed form that divides by the squared derivative
+/// magnitude, so it returns `NaN` whenever that quantity is not a usable
+/// number: for coincident control points, for deltas small enough to
+/// underflow, and for deltas large enough to overflow. One `NaN` poisons
+/// every arc-length accumulator downstream — dash phases go `NaN` and the
+/// pattern stops advancing, so the rest of the path renders as one
+/// uninterrupted dash.
+///
+/// Vanishing segments are dropped before they get here (see
+/// [`crate::split::is_degenerate`]); this covers the overflow end, where the
+/// segment has real length that simply cannot be measured. Substituting `0`
+/// keeps the phase finite so the rest of the path still dashes.
+#[inline]
+pub(crate) fn arclen(seg: &kurbo::PathSeg, accuracy: f64) -> f64 {
+    let len = kurbo::ParamCurveArclen::arclen(seg, accuracy);
+    if len.is_finite() { len } else { 0.0 }
+}
+
 /// `hypot` without the slow correctly-rounded library call.
 ///
 /// kurbo deliberately avoids `f64::hypot` for speed (its #448/#451); we

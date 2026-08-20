@@ -29,6 +29,7 @@ pub struct AlignedStrokeCtx {
     right: BezPath,
     scratch: BezPath,
     sink: BezPath,
+    band_buf: BezPath,
     dash_group: Vec<PathEl>,
     output: BezPath,
 }
@@ -119,6 +120,7 @@ pub fn stroke_aligned_with<'a>(
         right,
         scratch,
         sink,
+        band_buf,
         dash_group,
         output,
     } = ctx;
@@ -254,14 +256,17 @@ pub fn stroke_aligned_with<'a>(
         && uniform_fill_side.len() == region_ix.len()
         && uniform_fill_side.iter().all(|v| *v == uniform_fill_side[0]);
 
+    // The filled region, as closed contours re-wound so the fill is `+1`.
+    // Both the solid region construction and the dash mask work from it.
+    let normalized: Vec<BezPath> = region_ix
+        .iter()
+        .map(|&i| normalize_orientation(&pieces[i].els, pieces[i].fill_side.unwrap()))
+        .collect();
+
     let mut region_done = alloc::vec![false; pieces.len()];
     if region_mode {
         let into_fill = uniform_fill_side[0];
         let width_eff = pieces[region_ix[0]].eff_width;
-        let normalized: Vec<BezPath> = region_ix
-            .iter()
-            .map(|&i| normalize_orientation(&pieces[i].els, pieces[i].fill_side.unwrap()))
-            .collect();
         let specs: Vec<crate::region::ContourSpec<'_>> = normalized
             .iter()
             .map(|els| crate::region::ContourSpec {
@@ -341,10 +346,34 @@ pub fn stroke_aligned_with<'a>(
         }
     }
 
+    // Dashed one-sided bands cannot use the region construction (the band is
+    // cut into dashes first), so each dash is expanded directly and masked by
+    // the fill instead — otherwise a band that does not fit the local
+    // geometry escapes it (see `clip`).
+    let clip_source = (sanitized_dash.is_some() && !normalized.is_empty()).then(|| {
+        let mut fill = BezPath::new();
+        for els in &normalized {
+            fill.extend(els.iter());
+        }
+        // The mask only has to resolve the fill to within the accuracy the
+        // clip itself works at; flattening finer just costs edges.
+        crate::clip::ClipSource::new(&fill, split_accuracy * 0.25)
+    });
+
     for (ix, piece) in pieces.iter().enumerate() {
         if piece.eff_width <= 0.0 || region_done[ix] {
             continue;
         }
+        // Only closed contours have a fill relationship to mask against;
+        // an open subpath's side is a convention, not a region.
+        let clip = match (&clip_source, piece.fill_side) {
+            (Some(source), Some(fill_side)) if piece.closed => Some(dash::DashClip {
+                source,
+                keep_inside: fill_side == piece.side,
+                accuracy: split_accuracy,
+            }),
+            _ => None,
+        };
         let (d_left, d_right) = orient::side_distances(piece.side, piece.eff_width);
         let params = BandParams {
             d_left,
@@ -369,10 +398,12 @@ pub fn stroke_aligned_with<'a>(
                 0.0,
                 piece.true_start,
                 piece.true_end,
+                clip,
                 dash_group,
                 left,
                 right,
                 scratch,
+                band_buf,
                 output,
             ),
             (Some(d), Some(arcs)) => {
@@ -388,10 +419,12 @@ pub fn stroke_aligned_with<'a>(
                         arc.s0,
                         piece.true_start,
                         piece.true_end,
+                        clip,
                         dash_group,
                         left,
                         right,
                         scratch,
+                        band_buf,
                         output,
                     );
                 }

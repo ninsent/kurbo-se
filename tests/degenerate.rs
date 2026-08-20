@@ -4,7 +4,7 @@
 //! The degenerate-input matrix: no panics, no NaN in output,
 //! deterministic behavior. Every case runs at all alignments and joins.
 
-use kurbo::{BezPath, Cap, Join, Shape};
+use kurbo::{BezPath, Cap, Join, PathEl, Shape};
 use kurbo_se::{DashStyle, StrokeAlignment, StrokeStyle, stroke_aligned};
 
 const ALIGNMENTS: [StrokeAlignment; 3] = [
@@ -208,5 +208,117 @@ fn concave_star_matrix() {
     assert!(
         src_bb.contains_rect(out_bb),
         "inside star stroke escaped: {out_bb:?} vs {src_bb:?}"
+    );
+}
+
+/// Zero-length segments must not disturb dashing (2026-08-21 report).
+///
+/// `QuadBez::arclen` returns `NaN` for a fully degenerate quad, which used to
+/// poison the arc-length accumulator behind the dash phase: every dash past
+/// such an element came back as one uninterrupted band. Consecutive
+/// degenerate segments also read as the path revisiting a vertex, which split
+/// dashes there for no reason. The dashed result must match the same path
+/// with the degenerate elements removed by hand.
+#[test]
+fn zero_length_segments_do_not_break_dashing() {
+    let mut degenerate = BezPath::new();
+    degenerate.move_to((20.0, 100.0));
+    degenerate.line_to((20.0, 100.0));
+    degenerate.line_to((100.0, 40.0));
+    degenerate.line_to((100.0, 40.0));
+    degenerate.quad_to((100.0, 40.0), (100.0, 40.0));
+    degenerate.line_to((180.0, 100.0));
+    degenerate.curve_to((180.0, 100.0), (180.0, 100.0), (180.0, 100.0));
+    degenerate.line_to((100.0, 160.0));
+
+    // A quad whose control deltas underflow is finite input, is *not*
+    // point-coincident, and still has a NaN arc length upstream.
+    let mut subnormal = BezPath::new();
+    subnormal.move_to((20.0, 100.0));
+    subnormal.quad_to((20.0 + 1e-300, 100.0), (20.0 + 2e-300, 100.0));
+    subnormal.line_to((100.0, 40.0));
+    subnormal.line_to((180.0, 100.0));
+    subnormal.line_to((100.0, 160.0));
+
+    let mut clean = BezPath::new();
+    clean.move_to((20.0, 100.0));
+    clean.line_to((100.0, 40.0));
+    clean.line_to((180.0, 100.0));
+    clean.line_to((100.0, 160.0));
+
+    let count_subpaths = |p: &BezPath| {
+        p.elements()
+            .iter()
+            .filter(|el| matches!(el, PathEl::MoveTo(_)))
+            .count()
+    };
+
+    for alignment in [
+        StrokeAlignment::Center,
+        StrokeAlignment::Inside,
+        StrokeAlignment::Outside,
+    ] {
+        for cap in [Cap::Round, Cap::Butt, Cap::Square] {
+            let style = StrokeStyle::new(6.5)
+                .with_alignment(alignment)
+                .with_dash(DashStyle::from_pattern([13.0, 17.0]).with_cap(cap));
+            let b = stroke_aligned(&clean, &style, 0.01);
+            for (label, src) in [("zero-length", &degenerate), ("subnormal", &subnormal)] {
+                let a = stroke_aligned(src, &style, 0.01);
+                assert!(
+                    a.is_finite(),
+                    "{label}/{alignment:?}/{cap:?}: non-finite output"
+                );
+                assert_eq!(
+                    count_subpaths(&a),
+                    count_subpaths(&b),
+                    "{label}/{alignment:?}/{cap:?}: degenerate segments changed the dash count"
+                );
+                // Same painted area, so no dash silently became a solid band.
+                assert!(
+                    (a.area().abs() - b.area().abs()).abs() < 1.0,
+                    "{label}/{alignment:?}/{cap:?}: area {} vs clean {}",
+                    a.area().abs(),
+                    b.area().abs()
+                );
+            }
+        }
+    }
+}
+
+/// Square dash caps on a curve must not shatter a dash (2026-08-21 report).
+///
+/// A square cap overshoots the fill on a convex curve, so the fill mask runs.
+/// A source piece straddling the end of the band's shared edge was dropped
+/// whole as "coincident", stranding that edge as its own sliver: dashes came
+/// out as wedges plus slivers, twice as many subpaths as dashes.
+#[test]
+fn square_dash_caps_on_curves_stay_whole() {
+    let circle = kurbo::Circle::new((190.0, 110.0), 35.0).to_path(1e-6);
+    let count_subpaths = |p: &BezPath| {
+        p.elements()
+            .iter()
+            .filter(|el| matches!(el, PathEl::MoveTo(_)))
+            .count()
+    };
+    let dashes_for = |cap: Cap| {
+        let style = StrokeStyle::new(6.5)
+            .with_alignment(StrokeAlignment::Inside)
+            .with_dash(DashStyle::from_pattern([13.0, 17.0]).with_cap(cap));
+        let out = stroke_aligned(&circle, &style, 0.01);
+        (count_subpaths(&out), out.area().abs())
+    };
+    let (round_n, round_area) = dashes_for(Cap::Round);
+    let (square_n, square_area) = dashes_for(Cap::Square);
+    assert_eq!(
+        square_n, round_n,
+        "square caps produced {square_n} subpaths against {round_n} for round"
+    );
+    // Square caps add a little area per dash, never a lot: the wedge failure
+    // both lost and gained large slices.
+    let extra = square_area - round_area;
+    assert!(
+        extra > 0.0 && extra < 0.35 * round_area,
+        "square-cap area {square_area:.1} vs round {round_area:.1}"
     );
 }

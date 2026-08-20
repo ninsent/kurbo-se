@@ -73,7 +73,10 @@ Width profiles are out of scope.
   a closed contour's inside/outside band; overlapping bands just add.
 - **Dashing order:** the side is resolved from the undashed subpath, dashes
   are cut from the original centerline (lengths never distort with
-  alignment), then each dash is expanded independently. Closed contours
+  alignment), then each dash is expanded independently and **masked by the
+  fill**, so a dashed inside stroke stays inside and a dashed outside stroke
+  stays outside even where the band is wider than the local geometry (a dash
+  at a star's tip, a dash beside a self-intersection). Closed contours
   seam-merge (a dash across the seam stays one piece), so animating
   `dash.offset` never pops.
 - **Exact shared boundary:** for one-sided strokes, the boundary at
@@ -87,12 +90,12 @@ Measured on an Apple-silicon laptop, tolerance 0.25 (criterion, release):
 | Case | time |
 |---|---|
 | 10-point star (lines), inside, solid | 4.4 µs |
-| circle (62 segs), center, solid | 13.9 µs (kurbo's native stroker: 13.0 µs) |
+| circle (62 segs), center, solid | 13.6 µs (kurbo's native stroker: 12.6 µs) |
 | circle (62 segs), inside, solid | 31 µs |
-| circle, inside, dashed + round dash caps | 31 µs |
-| donut (124 segs, hole), inside, solid | 80 µs |
-| 40-cubic wavy path, inside, solid | 107 µs |
-| 40-cubic wavy path, inside, dashed | 144 µs |
+| circle, inside, dashed + round dash caps | 54 µs |
+| donut (124 segs, hole), inside, solid | 94 µs |
+| 40-cubic wavy path, inside, solid | 103 µs |
+| 40-cubic wavy path, inside, dashed | 139 µs |
 
 Centered strokes take a direct path and cost about the same as kurbo's own
 stroker. One-sided strokes pay for the region construction, but when the
@@ -102,6 +105,9 @@ machinery; polylines — the common UI case — stay in the single-digit
 microseconds. Degenerate widths (an offset collapsing to a point at
 `w = r`, or two offsets coinciding at half a ring's thickness) are guarded
 and stay near a millisecond instead of shredding into pathological work.
+Dashed one-sided strokes additionally mask each dash against the fill; the
+mask short-circuits wherever the band leaves the fill by less than
+`tolerance`, so the cost is a per-dash scan rather than a Boolean.
 
 Re-expanding per frame (e.g. animating `dash.offset`) is the supported
 model — no caching layer needed. Use [`stroke_aligned_with`] with a reused
@@ -150,8 +156,14 @@ and, gratefully, the design.
   overlaps itself so the fill winds twice, the erosion inside the
   double-wound part may still paint.
 - **Dashed strokes at extreme widths:** dashes are expanded as open bands
-  (each dash gets its own caps), so they do not saturate the way solid
-  closed contours do.
+  (each dash gets its own caps) and then masked by the fill, so they stay
+  contained but do not *saturate* the way solid closed contours do — where
+  the shape is thinner than the weight a dash covers it, but neighbouring
+  dashes do not merge to fill the shape solid.
+- **Dash masking is tolerance-driven:** a dash band that leaves the fill by
+  less than `tolerance` is left alone (on any convex curve every cap pokes
+  out by a fraction of the local sagitta). Ask for a finer tolerance and the
+  mask tightens accordingly.
 - **Dash phase per subpath:** the pattern restarts at each subpath
   (kurbo/`stroke_with` semantics); browsers continue it across subpaths.
 - Raw `Shape::area` on stroke outlines over-counts self-overlap pockets;

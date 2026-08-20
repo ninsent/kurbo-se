@@ -192,7 +192,7 @@ impl SourceIndex {
     /// Phrased as a predicate rather than a distance: a segment whose box is
     /// already beyond the threshold cannot disqualify the point, and the
     /// first violation ends the scan.
-    fn is_clear_of(&self, p: Point, thresh_sq: f64, contour: Option<usize>) -> bool {
+    pub(crate) fn is_clear_of(&self, p: Point, thresh_sq: f64, contour: Option<usize>) -> bool {
         if thresh_sq <= 0.0 {
             return true;
         }
@@ -230,7 +230,7 @@ impl SourceIndex {
     /// spans that bucket, and visiting a neighbour would double-count edges
     /// registered in both — which breaks the cancellation that makes the
     /// winding zero outside the shape.
-    fn winding(&self, p: Point) -> i32 {
+    pub(crate) fn winding(&self, p: Point) -> i32 {
         let Some(bucket) = self.bucket_of(p.y) else {
             return 0;
         };
@@ -432,9 +432,10 @@ pub(crate) fn region_loops(
 
     // --- raw offsets, one per contour ---
     let mut raws: Vec<BezPath> = Vec::with_capacity(contours.len());
-    // Per-raw, per-segment flags marking outer-side join geometry (exempt
-    // from the distance prune; see `keep_at`).
-    let mut raws_join: Vec<Vec<bool>> = Vec::with_capacity(contours.len());
+    // Per-raw, per-segment relaxation of the distance prune: `1` for plain
+    // offset geometry, `cos(φ/2)` where a bevel chord legitimately cuts its
+    // corner (see `keep_at`).
+    let mut raws_relax: Vec<Vec<f64>> = Vec::with_capacity(contours.len());
     for c in contours {
         let side = match kind {
             RegionKind::Erosion => c.fill_side,
@@ -465,7 +466,7 @@ pub(crate) fn region_loops(
         };
         if raw.elements().len() < 2 {
             raws.push(BezPath::new());
-            raws_join.push(Vec::new());
+            raws_relax.push(Vec::new());
             continue;
         }
         let mut closed = raw.clone();
@@ -478,29 +479,28 @@ pub(crate) fn region_loops(
         // drop it before it reaches the cutter.
         if closed.control_box().size().max_side() <= fuzz {
             raws.push(BezPath::new());
-            raws_join.push(Vec::new());
+            raws_relax.push(Vec::new());
             continue;
         }
         let n_segs = closed.segments().count();
-        let mut flags = alloc::vec![false; n_segs];
-        for (s0, s1) in join_spans {
-            for flag in flags
+        let mut relax = alloc::vec![1.0; n_segs];
+        for (s0, s1, factor) in join_spans {
+            for r in relax
                 .iter_mut()
                 .take((s1 as usize).min(n_segs))
                 .skip(s0 as usize)
             {
-                *flag = true;
+                *r = f64::min(*r, factor);
             }
         }
         raws.push(closed);
-        raws_join.push(flags);
+        raws_relax.push(relax);
     }
 
     // --- find every mutual and self intersection of the offsets ---
-    let cut = CutSegs::collect(&raws, &raws_join, accuracy);
+    let cut = CutSegs::collect(&raws, &raws_relax, accuracy);
 
     let thresh = (width * (1.0 - PRUNE_SLACK) - 2.0 * base.tolerance - index.slack()).max(0.0);
-    let thresh_sq = thresh * thresh;
     let want_filled = kind == RegionKind::Erosion;
     // Cross-contour membership needs the *other* raw loops' winding: with
     // miter/bevel joins a loop deviates from the distance-`w` set at
@@ -516,14 +516,25 @@ pub(crate) fn region_loops(
     let cw: Vec<bool> = contours.iter().map(|c| c.els.area() >= 0.0).collect();
     let live = raws.iter().filter(|r| r.elements().len() >= 2).count();
     let raw_index = (live >= 2).then(|| RawIndex::new(&raws, index.slack()));
-    let keep_at = |p: Point, owner: usize, is_join: bool| {
+    // The join relaxation applies to the dilation only. There, cutting a
+    // corner is the style the caller asked for and the strict test tears the
+    // union apart; the dilation never folds inward, so nothing needs the
+    // slack as a guard. For the erosion the distance test *is* the
+    // saturation guard — a spurious survivor becomes a hole in a shape that
+    // should be solid — and dropping a bevel chord costs nothing, because
+    // `stitch` bridges the gap with the very same chord.
+    let relax_joins = kind == RegionKind::Dilation;
+    let keep_at = |p: Point, owner: usize, relax: f64| {
         // Self-validity: far enough from the piece's *own* contour (prunes
         // fold-over past the local thickness). Only the own contour —
         // proximity to another contour says nothing under miter/bevel
         // joins, whose loops deviate from the distance-`w` set at corners;
-        // cross-contour validity is the winding test below. Join geometry
-        // is exempt (a bevel chord legitimately cuts the corner to w/√2).
-        if !is_join && !index.is_clear_of(p, thresh_sq, Some(owner)) {
+        // cross-contour validity is the winding test below. A bevel chord
+        // legitimately cuts its corner, so its own threshold is scaled by
+        // `cos(φ/2)` — bounded, unlike a blanket exemption, which at
+        // extreme widths let huge join fans survive inside the shape.
+        let thr = if relax_joins { thresh * relax } else { thresh };
+        if !index.is_clear_of(p, thr * thr, Some(owner)) {
             return false;
         }
         // The right side of the fill.
@@ -561,8 +572,8 @@ pub(crate) fn region_loops(
             let (mut valid, mut invalid) = (0usize, 0usize);
             for (ix, seg) in raw.segments().enumerate() {
                 if sample_ixs.contains(&ix) {
-                    let is_join = raws_join[ri].get(ix).copied().unwrap_or(false);
-                    if keep_at(seg.eval(0.5), ri, is_join) {
+                    let relax = raws_relax[ri].get(ix).copied().unwrap_or(1.0);
+                    if keep_at(seg.eval(0.5), ri, relax) {
                         valid += 1;
                     } else {
                         invalid += 1;
@@ -625,8 +636,8 @@ fn drop_unresolvable(loops: Vec<BezPath>, fuzz: f64) -> Vec<BezPath> {
 struct CutSegs {
     segs: Vec<PathSeg>,
     owner: Vec<usize>,
-    /// Outer-side join geometry flag per segment (distance-prune exempt).
-    join: Vec<bool>,
+    /// Distance-prune relaxation per segment (see `region_loops`).
+    relax: Vec<f64>,
     cuts: Vec<Vec<f64>>,
     /// Whether any cut lands in a segment's interior. Endpoint touches are
     /// dropped by `subdivide_at` anyway, so without interior cuts the
@@ -635,19 +646,19 @@ struct CutSegs {
 }
 
 impl CutSegs {
-    fn collect(raws: &[BezPath], raws_join: &[Vec<bool>], accuracy: f64) -> CutSegs {
+    fn collect(raws: &[BezPath], raws_relax: &[Vec<f64>], accuracy: f64) -> CutSegs {
         // Flatten to a segment list, remembering the owner and the index
         // range of each contour so adjacency can be recognised.
         let mut segs: Vec<PathSeg> = Vec::new();
         let mut owner: Vec<usize> = Vec::new();
-        let mut join: Vec<bool> = Vec::new();
+        let mut relax: Vec<f64> = Vec::new();
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(raws.len());
         for (ix, raw) in raws.iter().enumerate() {
             let start = segs.len();
             for (k, seg) in raw.segments().enumerate() {
                 segs.push(seg);
                 owner.push(ix);
-                join.push(raws_join[ix].get(k).copied().unwrap_or(false));
+                relax.push(raws_relax[ix].get(k).copied().unwrap_or(1.0));
             }
             ranges.push((start, segs.len()));
         }
@@ -691,19 +702,19 @@ impl CutSegs {
         CutSegs {
             segs,
             owner,
-            join,
+            relax,
             cuts,
             any_interior,
         }
     }
 
-    /// Subdivide every segment at its cuts. Returns `(owner, piece, join)`
+    /// Subdivide every segment at its cuts. Returns `(owner, piece, relax)`
     /// in owner-major path order.
-    fn materialize(mut self) -> Vec<(usize, PathSeg, bool)> {
+    fn materialize(mut self) -> Vec<(usize, PathSeg, f64)> {
         let mut out = Vec::with_capacity(self.segs.len());
         for i in 0..self.segs.len() {
             for piece in split::subdivide_at(&self.segs[i], &mut self.cuts[i]) {
-                out.push((self.owner[i], piece, self.join[i]));
+                out.push((self.owner[i], piece, self.relax[i]));
             }
         }
         out
