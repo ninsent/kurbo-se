@@ -91,13 +91,16 @@ Measured on an Apple-silicon laptop at tolerance 0.25 (criterion, release):
 
 | Case | time |
 |---|---|
-| 10-point star (lines), inside, solid | 4.4 µs |
+| 10-point star (lines), inside, solid | 7.0 µs |
 | circle (62 segs), center, solid | 50 µs (kurbo's native stroker: 12.9 µs) |
-| circle (62 segs), inside, solid | 31 µs |
-| circle, inside, dashed + round dash caps | 54 µs |
-| donut (124 segs, hole), inside, solid | 94 µs |
-| 40-cubic wavy path, inside, solid | 103 µs |
-| 40-cubic wavy path, inside, dashed | 139 µs |
+| circle (62 segs), inside, solid | 32 µs |
+| circle, inside, dashed + round dash caps | 55 µs |
+| donut (124 segs, hole), inside, solid | 99 µs |
+| 40-cubic wavy path, inside, solid | 106 µs |
+| 40-cubic wavy path, inside, dashed | 143 µs |
+
+Run-to-run variation on a laptop is a few percent, so treat these as
+magnitudes rather than exact figures.
 
 Solid centered strokes on closed contours use the same set construction as
 one-sided ones; that is what keeps an over-wide circle solid. Centered
@@ -180,6 +183,14 @@ the license and, gratefully, the design.
   mask.
 - Dash phase restarts at each subpath (kurbo `stroke_with` semantics);
   browsers continue it across subpaths.
+- Coordinate magnitude: this pipeline squares coordinates throughout, so a
+  path whose coordinates do not survive squaring — beyond roughly `1e154` —
+  is treated like non-finite input and yields an empty outline. Real
+  coordinate systems are nowhere near that.
+- Dashing cost is the path length divided by the pattern period, so a very
+  long path with a very short pattern produces correspondingly many dashes.
+  That work is real, not a defect, but it is worth knowing before dashing a
+  path that spans millions of units with a ten-unit pattern.
 - Raw `Shape::area` on stroke outlines over-counts self-overlap pockets.
   Measure regions by winding, not by summed signed area.
 

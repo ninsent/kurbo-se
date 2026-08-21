@@ -237,3 +237,85 @@ const ALIGNMENTS: [StrokeAlignment; 3] = [
     StrokeAlignment::Inside,
     StrokeAlignment::Outside,
 ];
+
+/// Coordinates a fuzzer would reach for: exact zeros, values that underflow
+/// when squared, values that overflow when squared, neighbours one ULP
+/// apart, and ordinary magnitudes to mix them with.
+const HOSTILE: [f64; 14] = [
+    0.0,
+    -0.0,
+    1.0,
+    -1.0,
+    1e-300,
+    -1e-300,
+    1e300,
+    -1e300,
+    f64::MIN_POSITIVE,
+    1.0 + f64::EPSILON,
+    1.0 - f64::EPSILON / 2.0,
+    100.0,
+    -100.0,
+    1e8,
+];
+
+/// Paths built from hostile coordinates, at every alignment, dashed and
+/// solid.
+///
+/// The contract is narrow and absolute: finite input yields finite output,
+/// and nothing panics or hangs. The hand-written matrix covers degenerate
+/// *shapes*; this covers degenerate *numbers*, which is where the
+/// interaction between the parametric epsilons and the pruning fuzz is
+/// hardest to reason about.
+#[test]
+fn hostile_coordinates_stay_finite() {
+    let mut rng = 0x9E3779B97F4A7C15u64;
+    let mut next = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        rng
+    };
+    for case in 0..200 {
+        let mut pick = || HOSTILE[(next() % HOSTILE.len() as u64) as usize];
+        let mut p = BezPath::new();
+        p.move_to((pick(), pick()));
+        for _ in 0..(2 + case % 4) {
+            match case % 3 {
+                0 => p.line_to((pick(), pick())),
+                1 => p.quad_to((pick(), pick()), (pick(), pick())),
+                _ => p.curve_to((pick(), pick()), (pick(), pick()), (pick(), pick())),
+            }
+        }
+        if case % 2 == 0 {
+            p.close_path();
+        }
+        let finite_input = p.is_finite();
+        let width = [0.0125, 1.0, 40.0][case % 3];
+        let alignment = ALIGNMENTS[case % 3];
+        let mut style = StrokeStyle::new(width).with_alignment(alignment);
+        if case % 5 == 0 {
+            // Scale the pattern to the path. The number of dashes is path
+            // length over pattern period, so a fixed pattern on a path
+            // spanning 1e8 asks for tens of millions of them — real work,
+            // correctly performed, and not what this test is about.
+            let unit = (p.control_box().size().max_side() / 50.0).max(1e-6);
+            style = style.with_dash(kurbo_se::DashStyle::new(0.7 * unit, 0.3 * unit));
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let path = p.clone();
+        std::thread::spawn(move || {
+            let r =
+                std::panic::catch_unwind(move || stroke_aligned(&path, &style, 1e-3).is_finite());
+            let _ = tx.send(r);
+        });
+        match rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(Ok(out_finite)) => assert!(
+                out_finite || !finite_input,
+                "case {case}: finite input produced non-finite output\npath: {p:?}"
+            ),
+            Ok(Err(_)) => panic!("case {case}: panicked\npath: {p:?}"),
+            Err(_) => panic!("case {case}: HANG (>10s)\npath: {p:?}"),
+        }
+    }
+}

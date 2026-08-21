@@ -34,11 +34,13 @@
 //! are rejoined with a straight line, which reproduces bevel-join chords
 //! exactly.
 
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
 use kurbo::{BezPath, ParamCurve, PathEl, PathSeg, Point, Rect, Shape};
 
 use crate::expand::{Band, BandParams};
+use crate::math;
 use crate::split;
 use crate::style::StrokeSide;
 
@@ -194,9 +196,22 @@ pub(crate) struct SourceIndex {
     flat_tol: f64,
 }
 
+/// Lower bound on a flattening tolerance, as a fraction of the geometry's
+/// own extent.
+///
+/// The number of line segments [`kurbo::flatten`] produces grows as the
+/// curve's size over the tolerance, and nothing upstream bounds it: a path
+/// spanning `1e300` flattened at `1e-3` asks for more segments than a `Vec`
+/// can describe, and the allocation aborts the process rather than
+/// returning. Resolving a shape to better than a billionth of itself is not
+/// meaningful in `f64` regardless, so tolerances finer than that are raised.
+/// At ordinary coordinate magnitudes this floor never binds.
+const MIN_RELATIVE_FLAT_TOL: f64 = 1e-9;
+
 impl SourceIndex {
     pub(crate) fn new(path: &BezPath, flat_tol: f64) -> Self {
-        let flat_tol = flat_tol.max(1e-9);
+        let extent = path.control_box().size().max_side();
+        let flat_tol = flat_tol.max(extent * MIN_RELATIVE_FLAT_TOL).max(1e-9);
         let mut edges: Vec<(Point, Point, u32, bool)> = Vec::new();
         let mut last: Option<Point> = None;
         let mut start: Option<Point> = None;
@@ -288,6 +303,11 @@ struct RawIndex {
 
 impl RawIndex {
     fn new(raws: &[BezPath], flat_tol: f64) -> RawIndex {
+        let extent = raws
+            .iter()
+            .map(|r| r.control_box().size().max_side())
+            .fold(0.0, f64::max);
+        let flat_tol = flat_tol.max(extent * MIN_RELATIVE_FLAT_TOL);
         let mut edges: Vec<(Point, Point, u32, bool)> = Vec::new();
         for (ix, raw) in raws.iter().enumerate() {
             let mut last: Option<Point> = None;
@@ -440,7 +460,18 @@ pub(crate) fn region_loops(
     // --- find every mutual and self intersection of the offsets ---
     let cut = CutSegs::collect(&raws, &raws_relax, accuracy);
 
-    let thresh = (width * (1.0 - PRUNE_SLACK) - 2.0 * base.tolerance - index.slack()).max(0.0);
+    // Approximation error is subtracted from the `dist >= w` test so that a
+    // legitimate boundary piece is never pruned. Below roughly twice the
+    // tolerance that subtraction consumes the whole width, and since
+    // `is_clear_of` treats a non-positive threshold as "always clear", the
+    // fold-over guard would switch off entirely — silently, and precisely
+    // for hairline strokes. Keep a fraction of the width instead: a
+    // boundary piece sits at `w` and still passes, while a fold-over piece
+    // at a fraction of `w` is still rejected. At any width where the
+    // subtraction leaves something meaningful this floor never binds.
+    let thresh = (width * (1.0 - PRUNE_SLACK) - 2.0 * base.tolerance - index.slack())
+        .max(0.25 * width)
+        .max(0.0);
     let want_filled = kind == RegionKind::Erosion;
     // Cross-contour membership needs the other raw loops' winding. With
     // miter and bevel joins a loop deviates from the distance-`w` set at
@@ -494,6 +525,25 @@ pub(crate) fn region_loops(
         }
     };
 
+    // Three samples, majority. Classifying a piece by its midpoint alone
+    // assumes validity is constant along it, which holds only while the cut
+    // set is complete — and it deliberately is not. Tangential touches are
+    // ignored, hits closer than `DEDUP_EPS` are merged, and the subdivision
+    // search stops at `MAX_DEPTH` and falls back to a chord solve. Any of
+    // those can leave a piece whose validity genuinely changes inside it,
+    // and one sample then picks a side arbitrarily: a hole in a region that
+    // should be solid, or a spur outside one.
+    // The first two samples settle the majority whenever they agree, which
+    // is the overwhelmingly common case, so the third is only paid for on a
+    // piece that actually straddles a decision.
+    let keep_piece = |seg: &PathSeg, owner: usize, relax: f64| {
+        let first = keep_at(seg.eval(0.5), owner, relax);
+        if keep_at(seg.eval(0.25), owner, relax) == first {
+            return first;
+        }
+        keep_at(seg.eval(0.75), owner, relax)
+    };
+
     // --- fast path: nothing cuts ---
     // Validity flips only across an intersection, since segment joints are
     // already piece boundaries. With no interior cuts every loop is
@@ -542,34 +592,57 @@ pub(crate) fn region_loops(
     let kept: Vec<Option<(usize, PathSeg)>> = cut
         .materialize()
         .into_iter()
-        .map(|(owner, seg, is_join)| keep_at(seg.eval(0.5), owner, is_join).then_some((owner, seg)))
+        .map(|(owner, seg, relax)| keep_piece(&seg, owner, relax).then_some((owner, seg)))
         .collect();
 
-    drop_unresolvable(stitch(&kept, accuracy), fuzz)
+    drop_unresolvable(stitch(&kept, accuracy, width), fuzz)
 }
 
 /// Empty out a region thinner than the pipeline's resolution.
 ///
-/// The loops describe the region by nonzero winding with consistent
-/// orientations, so the net signed area is the region's area, and
-/// `net / perimeter` bounds its mean thickness. A region thinner than the
-/// fuzz everywhere sits inside the documented boundary band. The case that
-/// matters is the cancel pair stitched from two nearly coincident offsets —
-/// a donut at exactly half its ring thickness — which otherwise ships
-/// hundreds of fuzz segments that paint nothing.
+/// Two different things make a region paint nothing. A single loop can be
+/// thin relative to its own perimeter, which is a per-loop test. Or a pair
+/// of nearly coincident loops can cancel under the nonzero rule, which is
+/// what a donut stroked at exactly half its ring thickness produces: each
+/// loop bounds real area, but together they enclose an annulus thinner than
+/// the pipeline can resolve.
+///
+/// Only the second needs the loops' *net* signed area, and that quantity
+/// means what it should only while every loop carries the orientation the
+/// nonzero rule expects. `stitch` can hand the walk across contours, which
+/// is exactly where that bookkeeping is easiest to lose, and a single
+/// reversed component would cancel a legitimate one and discard the whole
+/// region — a wide stroke silently filling solid, indistinguishable from
+/// intended saturation. So the net test applies only once the loops are
+/// confirmed to run within `fuzz` of one another, which is the geometry a
+/// real cancel pair has. Components that merely happen to sum near zero
+/// keep their loops.
 fn drop_unresolvable(loops: Vec<BezPath>, fuzz: f64) -> Vec<BezPath> {
-    let net: f64 = loops.iter().map(|l| l.elements().area()).sum();
-    let mut perimeter = 0.0;
-    for l in &loops {
+    let perimeter_of = |l: &BezPath| {
+        let mut per = 0.0;
         for seg in l.segments() {
-            perimeter += (seg.end() - seg.start()).hypot();
+            per += (seg.end() - seg.start()).hypot();
         }
+        per
+    };
+    let loops: Vec<BezPath> = loops
+        .into_iter()
+        .filter(|l| l.elements().area().abs() > 0.5 * fuzz * perimeter_of(l).max(1.0))
+        .collect();
+    if loops.len() < 2 {
+        return loops;
     }
-    if net.abs() <= 0.5 * fuzz * perimeter.max(1.0) {
-        Vec::new()
-    } else {
-        loops
+    let net: f64 = loops.iter().map(|l| l.elements().area()).sum();
+    let perimeter: f64 = loops.iter().map(&perimeter_of).sum();
+    if net.abs() > 0.5 * fuzz * perimeter.max(1.0) {
+        return loops;
     }
+    let index = RawIndex::new(&loops, fuzz * 0.25);
+    let coincident = loops.iter().enumerate().all(|(i, l)| {
+        l.segments()
+            .all(|seg| index.is_near_other(seg.eval(0.5), fuzz * fuzz, i))
+    });
+    if coincident { Vec::new() } else { loops }
 }
 
 /// The segments of a family of closed offset curves, with every mutual and
@@ -682,13 +755,62 @@ fn substantial_loop(path: &BezPath, accuracy: f64) -> bool {
 /// chord or a trimmed spike — it falls through to the next survivor of the
 /// same contour and bridges with a line. For a bevel join that line is the
 /// chord itself.
-fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64) -> Vec<BezPath> {
+/// Bridge chords longer than this multiple of the band width are refused.
+///
+/// A legitimate bridge replaces dropped join geometry, so it is bounded by
+/// the join: a bevel chord spans at most `2w`, and a miter leg at the miter
+/// limit somewhat more. A gap far beyond that means pruning removed a whole
+/// run of pieces, and connecting across it would draw a confident straight
+/// line through geometry that was never part of the boundary. Ending the
+/// loop there yields a visibly missing piece instead of a wrong one.
+const MAX_BRIDGE: f64 = 8.0;
+
+fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64, width: f64) -> Vec<BezPath> {
     let n = kept.len();
     let eps = (accuracy * 16.0).max(1e-9);
+    let max_bridge = MAX_BRIDGE * width;
     let mut used = alloc::vec![false; n];
     let mut loops = Vec::new();
 
-    while let Some(start) = (0..n).find(|&i| kept[i].is_some() && !used[i]) {
+    // Both lookups below were linear scans over every piece, which made the
+    // walk quadratic in surviving pieces: a detailed contour stroked wider
+    // than its own feature spacing cuts into tens of thousands of them, and
+    // that dominated everything else in the pipeline.
+    //
+    // Continuations are found through a grid of start points keyed at the
+    // match radius, so a query touches only the 3x3 cells that can hold a
+    // match. Bridges use a per-contour set of still-unused pieces, ordered,
+    // so "the next survivor of this contour after `cur`" is a range query.
+    // Both reproduce the old scans exactly, including their preference for
+    // the lowest index among equally valid candidates.
+    let cell = eps;
+    let key = |p: Point| -> (i64, i64) {
+        (
+            math::floor(p.x / cell) as i64,
+            math::floor(p.y / cell) as i64,
+        )
+    };
+    let mut starts: BTreeMap<(i64, i64), Vec<u32>> = BTreeMap::new();
+    let n_owners = kept.iter().flatten().map(|(o, _)| o + 1).max().unwrap_or(0);
+    let mut free: Vec<BTreeSet<usize>> = alloc::vec![BTreeSet::new(); n_owners];
+    for (i, k) in kept.iter().enumerate() {
+        if let Some((owner, seg)) = k {
+            starts.entry(key(seg.start())).or_default().push(i as u32);
+            free[*owner].insert(i);
+        }
+    }
+
+    let mut scan = 0usize;
+    loop {
+        // `used` only ever goes from false to true, so the search for the
+        // next unwalked piece never has to look back.
+        while scan < n && (kept[scan].is_none() || used[scan]) {
+            scan += 1;
+        }
+        if scan >= n {
+            break;
+        }
+        let start = scan;
         let first_pt = kept[start].unwrap().1.start();
         let mut path = BezPath::new();
         path.move_to(first_pt);
@@ -696,26 +818,51 @@ fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64) -> Vec<BezPath> {
         loop {
             used[cur] = true;
             let (owner, seg) = kept[cur].unwrap();
+            free[owner].remove(&cur);
             split::append_seg(&mut path, seg);
             let end = seg.end();
             if (end - first_pt).hypot() <= eps {
                 break;
             }
             // A survivor continuing from this exact point (any contour).
-            let mut next = (0..n).find(|&k| {
-                k != cur
-                    && !used[k]
-                    && kept[k].is_some_and(|(_, s)| (s.start() - end).hypot() <= eps)
-            });
+            let (kx, ky) = key(end);
+            let mut next: Option<usize> = None;
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    // Saturating: a coordinate far enough out of range that
+                    // its cell index pins to the end of `i64` would
+                    // otherwise overflow while stepping to the neighbour.
+                    let Some(bucket) = starts.get(&(kx.saturating_add(dx), ky.saturating_add(dy)))
+                    else {
+                        continue;
+                    };
+                    for &k in bucket {
+                        let k = k as usize;
+                        if k == cur || used[k] || next.is_some_and(|b| k > b) {
+                            continue;
+                        }
+                        if kept[k].is_some_and(|(_, s)| (s.start() - end).hypot() <= eps) {
+                            next = Some(k);
+                        }
+                    }
+                }
+            }
             if next.is_none() {
                 // Otherwise the next survivor of the same contour, bridged.
-                next = (1..=n)
-                    .map(|d| (cur + d) % n)
-                    .find(|&k| !used[k] && kept[k].is_some_and(|(o, _)| o == owner));
+                next = free[owner]
+                    .range(cur + 1..)
+                    .next()
+                    .or_else(|| free[owner].iter().next())
+                    .copied();
             }
             let Some(k) = next else { break };
             let s = kept[k].unwrap().1.start();
-            if (s - end).hypot() > eps {
+            let gap = (s - end).hypot();
+            if gap > eps {
+                if gap > max_bridge {
+                    // Too far to be dropped join geometry; leave the hole.
+                    break;
+                }
                 path.line_to(s);
             }
             cur = k;

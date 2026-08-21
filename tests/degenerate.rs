@@ -370,6 +370,88 @@ fn subnormal_subpath_is_a_dot() {
     assert!(stroke_aligned(&p, &sided, 1e-4).is_empty());
 }
 
+/// Hairline widths, where the pruning slack used to eat the whole distance
+/// threshold.
+///
+/// The `dist >= w` test subtracts approximation error from `w`, and below
+/// roughly twice the tolerance that subtraction went negative, clamped to
+/// zero, and turned the fold-over guard off — silently, and only for thin
+/// strokes. The band must still stay inside the shape at any width.
+#[test]
+fn hairline_widths_stay_contained() {
+    let rect = kurbo::Rect::new(0.0, 0.0, 100.0, 60.0);
+    let src = rect.to_path(1e-9);
+    let circle = kurbo::Circle::new((50.0, 50.0), 30.0).to_path(1e-6);
+    for (name, path) in [("rect", &src), ("circle", &circle)] {
+        for tol in [0.25, 0.01] {
+            for w in [2.0 * tol, tol, 0.1 * tol] {
+                for alignment in ALIGNMENTS {
+                    let style = StrokeStyle::new(w).with_alignment(alignment);
+                    let out = stroke_aligned(path, &style, tol);
+                    let label = format!("{name}/{alignment:?}/w={w}/tol={tol}");
+                    assert!(out.is_finite(), "{label}: non-finite");
+                    assert!(!out.is_empty(), "{label}: empty output");
+                    if alignment == StrokeAlignment::Inside {
+                        let bb = out.bounding_box();
+                        let src_bb = path.bounding_box().inflate(tol, tol);
+                        assert!(
+                            src_bb.contains_rect(bb),
+                            "{label}: inside stroke escaped the shape ({bb:?})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Self-intersection splitting must not depend on the caller's coordinate
+/// magnitude.
+///
+/// The vertex-coincidence radius is a distance, and while it was fixed at
+/// `1e-6` user units its meaning changed with the caller's units: the same
+/// drawing could split differently in pixels than in a normalized system.
+/// The radius is now relative to the subpath's extent.
+///
+/// This locks the property in rather than reproducing a past failure. The
+/// anchors below miss by a millionth of the extent, which the old radius
+/// did call coincident at small scales, but the strands of a figure-eight
+/// genuinely cross there, so the ordinary intersection search splits the
+/// contour either way and the outputs agree.
+#[test]
+fn self_intersection_splitting_is_scale_invariant() {
+    // A near-miss: the return visit is offset by 1e-6 of the extent.
+    const NEAR_MISS: f64 = 240.0 * 1e-6;
+    let mut base = BezPath::new();
+    base.move_to((120.0, 100.0));
+    base.curve_to((150.0, 55.0), (210.0, 55.0), (240.0, 100.0));
+    base.curve_to((210.0, 145.0), (150.0, 145.0), (120.0 + NEAR_MISS, 100.0));
+    base.curve_to((90.0, 55.0), (30.0, 55.0), (0.0, 100.0));
+    base.curve_to((30.0, 145.0), (90.0, 145.0), (120.0, 100.0));
+    base.close_path();
+
+    let count_subpaths = |p: &BezPath| {
+        p.elements()
+            .iter()
+            .filter(|el| matches!(el, PathEl::MoveTo(_)))
+            .count()
+    };
+
+    // Same shape and same width-to-shape ratio at three coordinate scales.
+    let mut counts = vec![];
+    for scale in [1e-3, 1.0, 1e3] {
+        let path = kurbo::Affine::scale(scale) * base.clone();
+        let style = StrokeStyle::new(8.0 * scale).with_alignment(StrokeAlignment::Inside);
+        let out = stroke_aligned(&path, &style, 1e-3 * scale);
+        assert!(out.is_finite(), "scale {scale}: non-finite");
+        counts.push(count_subpaths(&out));
+    }
+    assert!(
+        counts.iter().all(|c| *c == counts[0]),
+        "lobe splitting changed with coordinate scale: {counts:?}"
+    );
+}
+
 /// Square dash caps on a curve must not shatter a dash (2026-08-21 report).
 ///
 /// A square cap overshoots the fill on a convex curve, so the fill mask runs.

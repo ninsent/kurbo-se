@@ -142,7 +142,21 @@ pub(crate) fn split_self_intersections(
     // crossing with cuts at the segment ends. A revisit of a closed
     // subpath's start point pairs with the seam, the end of the last
     // segment.
-    const VTX_EPS2: f64 = 1e-12;
+    // Coincidence radius for "the path revisits this anchor", relative to
+    // the subpath's own extent rather than absolute in user coordinates.
+    // An absolute epsilon means something different for a shape authored in
+    // pixels than for the same shape in a 0..1 coordinate system: too loose
+    // at small scales, where it merges genuinely distinct vertices, and too
+    // tight at large ones. Exactly coincident anchors — what real path data
+    // carries — match under any radius.
+    let extent = {
+        let bb = kurbo::BezPath::from_vec(subpath.to_vec()).control_box();
+        bb.size().max_side()
+    };
+    let vtx_eps2 = {
+        let e = 1e-9 * extent;
+        (e * e).max(f64::MIN_POSITIVE)
+    };
     let vertex_after: Vec<Point> = segs.iter().map(|s| s.end()).collect();
     for i in 0..n.saturating_sub(1) {
         for j in (i + 1)..n {
@@ -151,7 +165,7 @@ pub(crate) fn split_self_intersections(
                 // T-touch, not a crossing.
                 continue;
             }
-            if (vertex_after[i] - vertex_after[j]).hypot2() <= VTX_EPS2 {
+            if (vertex_after[i] - vertex_after[j]).hypot2() <= vtx_eps2 {
                 push_crossing(&mut cuts, (i, 1.0), (j, 1.0));
             }
         }
@@ -355,12 +369,22 @@ pub(crate) fn segment_pair_params(
         if wrap { 1.0 - ADJ_TRIM } else { 1.0 },
     );
     let mut hits = Vec::new();
+    let mut budget = SEARCH_BUDGET;
     if next || wrap {
         let a_sub = a.subsegment(ar.0..ar.1);
         let b_sub = b.subsegment(br.0..br.1);
-        recurse(&a_sub, ar, &b_sub, br, accuracy.max(1e-9), 0, &mut hits);
+        recurse(
+            &a_sub,
+            ar,
+            &b_sub,
+            br,
+            accuracy.max(1e-9),
+            0,
+            &mut hits,
+            &mut budget,
+        );
     } else {
-        recurse(a, ar, b, br, accuracy.max(1e-9), 0, &mut hits);
+        recurse(a, ar, b, br, accuracy.max(1e-9), 0, &mut hits, &mut budget);
     }
     dedupe(&mut hits);
     hits
@@ -440,6 +464,7 @@ fn seg_self_intersections(seg: &PathSeg, accuracy: f64) -> Vec<(f64, f64)> {
     bounds.extend(ts);
     bounds.push(1.0);
     let mut hits = Vec::new();
+    let mut budget = SEARCH_BUDGET;
     for i in 0..bounds.len() - 1 {
         for j in (i + 1)..bounds.len() - 1 {
             let (a0, mut a1) = (bounds[i], bounds[i + 1]);
@@ -459,6 +484,7 @@ fn seg_self_intersections(seg: &PathSeg, accuracy: f64) -> Vec<(f64, f64)> {
                 accuracy.max(1e-9),
                 0,
                 &mut hits,
+                &mut budget,
             );
         }
     }
@@ -473,6 +499,24 @@ fn dedupe(hits: &mut Vec<(f64, f64)>) {
 
 const MAX_DEPTH: u32 = 28;
 
+/// Node budget for one intersection search.
+///
+/// Bounding-box rejection normally prunes the subdivision tree to a few
+/// dozen nodes. Nothing prunes it when every box overlaps every other and
+/// flatness never converges, which is what overflow-scale coordinates
+/// produce: differences of `1e300` are not finite when squared, so no
+/// subdivision ever looks flat and no pair ever separates. The tree then
+/// runs to `MAX_DEPTH` down every branch, and 2^28 nodes is not a
+/// computation that finishes — a four-segment path was enough to hang the
+/// call indefinitely.
+///
+/// The budget bounds that. A search that exhausts it returns the hits it
+/// found so far, which for geometry this degenerate is no worse than the
+/// alternative, and the caller stays responsive. Well-behaved input never
+/// comes close to the limit.
+const SEARCH_BUDGET: u32 = 10_000;
+
+#[allow(clippy::too_many_arguments)]
 fn recurse(
     a: &PathSeg,
     ar: (f64, f64),
@@ -481,7 +525,12 @@ fn recurse(
     accuracy: f64,
     depth: u32,
     out: &mut Vec<(f64, f64)>,
+    budget: &mut u32,
 ) {
+    if *budget == 0 {
+        return;
+    }
+    *budget -= 1;
     let ba = a.bounding_box();
     let bb = b.bounding_box();
     if ba.x0 > bb.x1 + accuracy
@@ -518,14 +567,14 @@ fn recurse(
         let am = 0.5 * (ar.0 + ar.1);
         let a_lo = a.subsegment(0.0..0.5);
         let a_hi = a.subsegment(0.5..1.0);
-        recurse(&a_lo, (ar.0, am), b, br, accuracy, depth + 1, out);
-        recurse(&a_hi, (am, ar.1), b, br, accuracy, depth + 1, out);
+        recurse(&a_lo, (ar.0, am), b, br, accuracy, depth + 1, out, budget);
+        recurse(&a_hi, (am, ar.1), b, br, accuracy, depth + 1, out, budget);
     } else {
         let bm = 0.5 * (br.0 + br.1);
         let b_lo = b.subsegment(0.0..0.5);
         let b_hi = b.subsegment(0.5..1.0);
-        recurse(a, ar, &b_lo, (br.0, bm), accuracy, depth + 1, out);
-        recurse(a, ar, &b_hi, (bm, br.1), accuracy, depth + 1, out);
+        recurse(a, ar, &b_lo, (br.0, bm), accuracy, depth + 1, out, budget);
+        recurse(a, ar, &b_hi, (bm, br.1), accuracy, depth + 1, out, budget);
     }
 }
 

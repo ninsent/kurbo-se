@@ -2,7 +2,76 @@
 
 This changelog follows <https://keepachangelog.com/en/>.
 
-## 0.1.0 (unreleased)
+## 0.1.1 (2026-08-22)
+
+### Fixed
+
+- Overflow-scale coordinates could hang the call outright. When every
+  bounding box overlaps every other and no subdivision ever looks flat —
+  what differences of `1e300` produce — the intersection search ran to its
+  full depth down every branch, and 2^28 nodes never finishes. A
+  four-segment path was enough. The search now carries a node budget, and
+  paths whose coordinates do not survive squaring (beyond roughly `1e154`)
+  are gated at the input like non-finite ones, since every predicate in the
+  pipeline is meaningless there and kurbo's own arc-length solver panics on
+  them.
+- The flattening tolerance is now floored at a fraction of the geometry's
+  own extent. `kurbo::flatten` emits segments in proportion to size over
+  tolerance and nothing bounds that: a path spanning `1e300` flattened at
+  `1e-3` asked for more segments than a `Vec` can hold and aborted the
+  process on allocation.
+- A bridge chord in the region stitcher is refused past a multiple of the
+  stroke width. It exists to replace dropped join geometry, which is bounded
+  by the join, but nothing stopped it spanning an arbitrary distance when
+  pruning removed a long run of pieces — drawing a confident straight line
+  through geometry that was never part of the boundary. The loop now ends
+  there instead, which is visible rather than plausible.
+- Region pieces are classified from three samples rather than one.
+  A single midpoint sample assumes validity is constant along a piece, which
+  holds only while the cut set is complete, and it deliberately is not:
+  tangential touches are ignored, near-coincident hits are merged, and the
+  subdivision search stops at a depth limit.
+- The saturation test is now per-component. It compared a *net* signed area
+  summed across every loop, so one component emitted with reversed winding
+  could cancel a legitimate one and discard the whole region — a wide stroke
+  silently filling solid, indistinguishable from intended saturation. The
+  net test is kept for genuine cancel pairs (a donut at exactly half its
+  ring thickness) but applies only once the loops are confirmed to run
+  within the resolution of one another.
+- The vertex-coincidence radius scales with the subpath's extent instead of
+  being fixed at `1e-6` user units, so self-intersection splitting no longer
+  depends on whether the caller works in pixels or in a normalized system.
+- Hairline widths keep a working fold-over guard. Below roughly twice the
+  tolerance, the approximation slack consumed the whole distance threshold
+  and the guard switched itself off.
+
+### Changed
+
+- Region stitching uses a spatial grid for continuations and an ordered
+  per-contour set for bridges, replacing two linear scans that made the walk
+  quadratic in surviving pieces. A detailed contour stroked wider than its
+  own feature spacing cuts into tens of thousands of pieces, and that
+  dominated everything else: a 1500-segment gear at width 8 went from 254 ms
+  to 28 ms. Output is unchanged, including the preference for the
+  lowest-indexed candidate.
+- The extra sampling costs the 10-point star, which goes 4.7 → 7.0 µs: a
+  polyline of sharp reflex corners sends nearly every piece through the
+  cut-and-prune path, which is where the samples are taken. Measured
+  against the previous code on the same machine back to back, every other
+  benchmark is unchanged or slightly faster, the 40-cubic wavy path by 4%,
+  since the stitcher's grid replaces linear scans there.
+
+### Added
+
+- `hostile_coordinates_stay_finite`: 200 deterministic cases built from
+  coordinates a fuzzer would reach for — exact zeros, values that underflow
+  or overflow when squared, ULP-apart neighbours — at every alignment,
+  dashed and solid, each under a watchdog. It found the hang and the
+  allocation abort above.
+- Tests for hairline widths at and below the tolerance, and for
+  scale-invariant self-intersection splitting.
+
+## 0.1.0 (2026-08-21)
 
 Initial release, targeting kurbo 0.13.
 

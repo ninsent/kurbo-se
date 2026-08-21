@@ -99,7 +99,7 @@ pub fn stroke_aligned_with<'a>(
 
     normalize::collect_canonical(path.path_elements(tolerance), &mut ctx.input);
     // Input gate: non-finite geometry would propagate NaN into the output.
-    if !ctx.input.is_finite() || ctx.input.elements().is_empty() {
+    if !ctx.input.is_finite() || ctx.input.elements().is_empty() || !representable(&ctx.input) {
         return &ctx.output;
     }
 
@@ -488,6 +488,24 @@ pub fn stroke_aligned_with<'a>(
     &ctx.output
 }
 
+/// Whether the geometry is small enough to compute with.
+///
+/// This pipeline squares coordinates everywhere — segment lengths, cross
+/// products, signed areas, every distance predicate — so a coordinate whose
+/// square overflows makes all of them meaningless, and the result would be
+/// a confident answer derived from infinities. kurbo's own solvers do not
+/// survive it either: measuring an arc length across such a span panics
+/// inside its root finder rather than returning. The cutoff is where `x * x`
+/// stops being finite, a little over `1e154`, which is far outside any real
+/// coordinate system. Paths beyond it are treated like non-finite input and
+/// produce an empty outline.
+fn representable(path: &BezPath) -> bool {
+    let cb = path.control_box();
+    [cb.x0, cb.y0, cb.x1, cb.y1]
+        .iter()
+        .all(|v| (v * v).is_finite())
+}
+
 /// Shared setup for the set-theoretic region construction over `normalized`
 /// contours (fill re-wound to `+1`): per-contour specs, the flattened source
 /// index behind the distance/winding predicates, and raw-offset band
@@ -597,7 +615,7 @@ pub fn analyze_subpaths(
     let mut input = BezPath::new();
     normalize::collect_canonical(path.path_elements(tolerance), &mut input);
     let mut infos = alloc::vec::Vec::new();
-    if !input.is_finite() {
+    if !input.is_finite() || !representable(&input) {
         return infos;
     }
     let probe_scale = input.control_box().size().max_side();
