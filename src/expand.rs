@@ -127,6 +127,14 @@ impl<'a> Band<'a> {
 
     /// Expand a stream of path elements (one or more subpaths, all sharing
     /// this band's caps). Mirrors kurbo's `stroke_undashed` loop.
+    ///
+    /// Degenerate-input contract: underflow-scale segments (no normalizable
+    /// tangent) are dropped by `normalize::collect_canonical` before any
+    /// element stream reaches this point, so the exact-equality checks below
+    /// only need to catch the exactly coincident points that dashing
+    /// produces (a zero-length dash is a `MoveTo p, LineTo p` pair). The
+    /// closing chord is synthesized *here*, after canonicalization, and can
+    /// still be subnormal — it gets the underflow-aware gate.
     pub(crate) fn run(&mut self, els: impl IntoIterator<Item = PathEl>) {
         for el in els {
             let p0 = self.last_pt;
@@ -163,7 +171,7 @@ impl<'a> Band<'a> {
                     }
                 }
                 PathEl::ClosePath => {
-                    if p0 != self.start_pt {
+                    if (self.start_pt - p0).hypot2() > 0.0 {
                         let tangent = self.start_pt - p0;
                         self.do_join(tangent);
                         self.last_tan = tangent;
@@ -178,7 +186,16 @@ impl<'a> Band<'a> {
 
     /// Unit right normal of a (nonzero) tangent.
     fn unit_norm(tan: Vec2) -> Vec2 {
-        tan.turn_90() * (1.0 / tan.hypot())
+        let h = tan.hypot();
+        if h == 0.0 {
+            // The run() gates keep degenerate segments out, but a tangent
+            // can still underflow through the curve fallbacks when every
+            // control point clusters below ~1e-162. No direction is
+            // recoverable there; a zero normal collapses the offset onto
+            // the path (winding-neutral) instead of dividing by zero.
+            return Vec2::ZERO;
+        }
+        tan.turn_90() * (1.0 / h)
     }
 
     fn do_line(&mut self, tangent: Vec2, p1: Point) {
@@ -269,7 +286,9 @@ impl<'a> Band<'a> {
                 let mt = 1.0 - t;
                 let z = mt * (mt * mt * p[0] + 3.0 * t * (mt * p[1] + t * p[2])) + t * t * t * p[3];
                 let p = ref_pt + z * ref_vec;
-                if p != self.last_pt {
+                // Underflow-aware (like the run() gates): a sub-resolution
+                // hop to the cusp point has no usable tangent.
+                if (p - self.last_pt).hypot2() > 0.0 {
                     let tan = p - self.last_pt;
                     self.do_join(tan);
                     self.do_line(tan, p);
@@ -277,7 +296,7 @@ impl<'a> Band<'a> {
                 }
             }
         }
-        if c.p3 != self.last_pt {
+        if (c.p3 - self.last_pt).hypot2() > 0.0 {
             let tan = c.p3 - self.last_pt;
             self.do_join(tan);
             self.do_line(tan, c.p3);

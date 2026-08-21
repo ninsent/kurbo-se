@@ -88,12 +88,17 @@ body {
   width: 60px;
   text-align: right;
 }
+.row input.pattern {
+  flex: 1;
+  min-width: 0;
+}
 .row select {
   flex: 1;
   min-width: 0;
 }
 
 input[type="number"],
+input.pattern,
 select {
   background: var(--field);
   color: var(--text);
@@ -104,6 +109,7 @@ select {
   outline: none;
 }
 input[type="number"]:focus-visible,
+input.pattern:focus-visible,
 select:focus-visible {
   border-color: var(--accent);
 }

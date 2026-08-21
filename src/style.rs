@@ -55,8 +55,11 @@ pub enum StrokeSide {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DashStyle {
-    /// Alternating dash/gap lengths. Arbitrary length; odd-length patterns
-    /// behave as if doubled (SVG semantics).
+    /// Alternating dash/gap lengths, Figma-style: entries at **even indices
+    /// are dash lengths**, entries at **odd indices are gaps**. Arbitrary
+    /// length; an odd-length pattern behaves as if read twice
+    /// (`2, 7, 4` ≡ `2, 7, 4, 2, 7, 4` — SVG semantics), so dashes and gaps
+    /// never swap roles as the pattern repeats.
     ///
     /// Entries must be finite and `>= 0` with a positive sum; patterns that
     /// violate this are treated as *solid* (documented fallback, kurbo's raw
@@ -71,6 +74,13 @@ pub struct DashStyle {
     /// [`StrokeStyle::end_cap`]; every dash-generated edge uses this cap.
     /// Zero-length dashes render as dots for `Round` (circle) and `Square`
     /// (oriented square); `Butt` renders nothing.
+    ///
+    /// Known limitation: a pattern whose single dash swallows an entire
+    /// closed contour (dash length ≥ perimeter with a zero gap) expands as
+    /// an unmasked ring, so at widths beyond the local thickness it can
+    /// cross the fill boundary where a genuinely dashed or solid stroke
+    /// would not. Such a pattern means "not actually dashed" — drop `dash`
+    /// instead to get the solid construction.
     pub cap: Cap,
 }
 
@@ -87,7 +97,13 @@ impl DashStyle {
         }
     }
 
-    /// A dash style from an arbitrary pattern of alternating dash/gap lengths.
+    /// A dash style from an arbitrary pattern of alternating dash/gap
+    /// lengths (see [`DashStyle::pattern`] for the index roles).
+    ///
+    /// ```
+    /// let d = kurbo_se::DashStyle::from_pattern([2.0, 4.0, 6.0, 8.0]);
+    /// assert_eq!(d.pattern.as_slice(), &[2.0, 4.0, 6.0, 8.0]);
+    /// ```
     pub fn from_pattern(pattern: impl IntoIterator<Item = f64>) -> Self {
         DashStyle {
             pattern: pattern.into_iter().collect(),

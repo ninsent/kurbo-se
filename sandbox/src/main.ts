@@ -36,8 +36,10 @@ const state = {
   startCap: "none" as "none" | "round" | "square",
   endCap: "none" as "none" | "round" | "square",
   dashed: false,
-  dashLen: 18,
-  gap: 10,
+  // Figma-style pattern: even indices are dash lengths, odd indices gaps;
+  // an odd-length list reads as doubled (2,7,4 -> 2,7,4,2,7,4), same as
+  // SVG stroke-dasharray and the crate.
+  dashPattern: [18, 10] as number[],
   dashOffset: 0,
   dashCap: "none" as "none" | "round" | "square",
   animate: false,
@@ -268,6 +270,33 @@ function checkbox(get: () => boolean, set: (v: boolean) => void): HTMLElement {
   return c;
 }
 
+/// "2, 4, 6, 8" -> [2, 4, 6, 8]: comma/space separated, non-negative finite
+/// entries only. An empty result means "no usable pattern" (renders solid,
+/// the crate's documented fallback for unusable patterns).
+function parseDashPattern(text: string): number[] {
+  return text
+    .split(/[,\s]+/)
+    .filter((t) => t.length > 0)
+    .map((t) => parseFloat(t))
+    .filter((v) => Number.isFinite(v) && v >= 0);
+}
+
+/// Figma-style dash pattern input. Re-renders as you type; normalizes the
+/// text on blur (so half-typed junk doesn't get rewritten under the cursor).
+function dashPatternInput(): HTMLElement {
+  const n = h("input", { type: "text", class: "pattern" });
+  n.placeholder = "e.g. 2, 4, 6, 8";
+  n.value = state.dashPattern.join(", ");
+  n.oninput = () => {
+    state.dashPattern = parseDashPattern(n.value);
+    render();
+  };
+  n.onchange = () => {
+    n.value = state.dashPattern.join(", ");
+  };
+  return n;
+}
+
 function buildPanel() {
   const panel = document.getElementById("panel")!;
   panel.replaceChildren(
@@ -305,8 +334,7 @@ function buildPanel() {
     group(
       "Dash",
       row("Style", segmented([["solid", "Solid"], ["dash", "Dash"]], () => (state.dashed ? "dash" : "solid"), (v) => (state.dashed = v === "dash"))),
-      row("Dash", ...slider(0, 60, 1, () => state.dashLen, (v) => (state.dashLen = v))),
-      row("Gap", ...slider(0, 60, 1, () => state.gap, (v) => (state.gap = v))),
+      row("Dashes", dashPatternInput()),
       row("Dash offset", ...slider(-120, 120, 0.5, () => state.dashOffset, (v) => (state.dashOffset = v))),
       row("Dash cap", select(CAPS, () => state.dashCap, (v) => (state.dashCap = v))),
       row(
@@ -364,7 +392,7 @@ function styleJson(): string {
     startCap: state.startCap,
     endCap: state.endCap,
     dash: state.dashed
-      ? { pattern: [state.dashLen, state.gap], offset: state.dashOffset, cap: state.dashCap }
+      ? { pattern: state.dashPattern, offset: state.dashOffset, cap: state.dashCap }
       : null,
   });
 }
@@ -434,8 +462,10 @@ function render() {
       "stroke-linejoin": state.join === "miter" ? "miter" : state.join,
       "stroke-miterlimit": debug.miterLimit,
     };
-    if (state.dashed) {
-      attrs["stroke-dasharray"] = `${state.dashLen} ${state.gap}`;
+    if (state.dashed && state.dashPattern.length > 0) {
+      // SVG stroke-dasharray shares the semantics exactly (even entries are
+      // dashes, odd-length lists double), so the oracle stays valid.
+      attrs["stroke-dasharray"] = state.dashPattern.join(" ");
       attrs["stroke-dashoffset"] = -state.dashOffset;
     }
     ref.append(svgEl("path", attrs));
@@ -771,8 +801,16 @@ function applyQueryParams() {
   str("startCap", ["none", "round", "square"], (v) => (state.startCap = v));
   str("endCap", ["none", "round", "square"], (v) => (state.endCap = v));
   flag("dashed", (v) => (state.dashed = v));
-  num("dash", (v) => (state.dashLen = v));
-  num("gap", (v) => (state.gap = v));
+  // `dashes=2,4,6,8`; the legacy `dash`/`gap` pair still works so old
+  // shared URLs keep rendering the same thing.
+  const dashes = q.get("dashes");
+  if (dashes !== null) {
+    state.dashPattern = parseDashPattern(dashes);
+  } else {
+    const d = parseFloat(q.get("dash") ?? "");
+    const g = parseFloat(q.get("gap") ?? "");
+    if (Number.isFinite(d) && Number.isFinite(g)) state.dashPattern = [d, g];
+  }
   num("dashOffset", (v) => (state.dashOffset = v));
   str("dashCap", ["none", "round", "square"], (v) => (state.dashCap = v));
   num("tol", (v) => (state.tolerance = v));

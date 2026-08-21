@@ -23,7 +23,9 @@ slower and feels laggy); `npm run build` uses `wasm-pack --release`.
 - **Panel** mirrors Figma's stroke settings — a Fill group (show/hide +
   colour), stroke colour, Alignment (Inside/Center/Outside), raw Side
   override (Left/Center/Right), Weight, Join + Miter angle (degrees),
-  per-end caps, Dash/Gap/Dash offset/Dash cap — plus a tolerance selector.
+  per-end caps, Dashes (a comma-separated pattern like Figma's: `2, 4, 6, 8`
+  — even entries are dash lengths, odd entries gaps, and an odd-length list
+  reads as doubled)/Dash offset/Dash cap — plus a tolerance selector.
 - **Stroke result** renders the expanded outline with the **nonzero** rule
   (the output's contract) in the chosen stroke colour, over the shape's own
   fill. Toggle **Even-odd rule** to x-ray the self-overlap structure —

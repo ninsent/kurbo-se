@@ -85,7 +85,11 @@
 
 #![cfg_attr(not(feature = "std"), no_std)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
-#![deny(missing_docs)]
+// From the Linebender lint set. These live here rather than in Cargo.toml's
+// [lints] table because they need cfg_attr or must not apply to tests.
+#![cfg_attr(not(test), warn(unused_crate_dependencies))]
+#![cfg_attr(target_pointer_width = "64", warn(clippy::trivially_copy_pass_by_ref))]
+#![warn(clippy::print_stdout, clippy::print_stderr)]
 
 #[cfg(not(any(feature = "std", feature = "libm")))]
 compile_error!("kurbo-se requires either the `std` or `libm` feature");

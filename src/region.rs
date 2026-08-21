@@ -61,76 +61,23 @@ pub(crate) struct ContourSpec<'a> {
     pub fill_side: StrokeSide,
 }
 
-/// Source geometry prepared for the two hot predicates: "is this point inside
-/// the region?" and "is it far enough from the path?".
+/// Y-bucketed flattened edges: the machinery shared by [`SourceIndex`] and
+/// [`RawIndex`].
 ///
-/// Both would otherwise be a per-curve solve — [`kurbo::Shape::winding`],
-/// [`kurbo::ParamCurveNearest::nearest`] — evaluated once per candidate
-/// piece, which dominates the pipeline. The path is flattened once instead
-/// and its edges bucketed by `y`, so a query touches only the edges that can
-/// matter. Flattening error is folded into the distance threshold.
-pub(crate) struct SourceIndex {
-    /// `(a, b, real, contour)`; `real == false` marks an implicit closing
-    /// edge, which counts for winding but is not part of the path for
-    /// distance. `contour` is the subpath ordinal, so the distance test can
-    /// be restricted to a piece's own contour (cross-contour validity is a
-    /// winding question, not a distance one — see `region_loops`).
-    edges: Vec<(Point, Point, bool, u32)>,
+/// An edge is `(a, b, tag, real)` — the flattened segment, the ordinal of
+/// the contour (or raw loop) it belongs to, and whether it is part of the
+/// path for distance purposes (`real == false` marks an implicit closing
+/// chord, which counts for winding only). The predicates take a per-edge
+/// filter so each wrapper can scope a query to, or away from, one tag.
+struct EdgeIndex {
+    edges: Vec<(Point, Point, u32, bool)>,
     buckets: Vec<Vec<u32>>,
     y0: f64,
     inv_h: f64,
-    flat_tol: f64,
 }
 
-impl SourceIndex {
-    pub(crate) fn new(path: &BezPath, flat_tol: f64) -> Self {
-        let flat_tol = flat_tol.max(1e-9);
-        let mut edges: Vec<(Point, Point, bool, u32)> = Vec::new();
-        let mut last: Option<Point> = None;
-        let mut start: Option<Point> = None;
-        let mut sub: u32 = 0;
-        let mut seen_move = false;
-        let close = |edges: &mut Vec<(Point, Point, bool, u32)>,
-                     last: Option<Point>,
-                     s: Option<Point>,
-                     sub: u32| {
-            if let (Some(prev), Some(s)) = (last, s) {
-                if (s - prev).hypot2() > 0.0 {
-                    edges.push((prev, s, false, sub));
-                }
-            }
-        };
-        kurbo::flatten(path.iter(), flat_tol, |el| match el {
-            PathEl::MoveTo(p) => {
-                close(&mut edges, last, start, sub);
-                if seen_move {
-                    sub += 1;
-                } else {
-                    seen_move = true;
-                }
-                last = Some(p);
-                start = Some(p);
-            }
-            PathEl::LineTo(p) => {
-                if let Some(prev) = last {
-                    if (p - prev).hypot2() > 0.0 {
-                        edges.push((prev, p, true, sub));
-                    }
-                }
-                last = Some(p);
-            }
-            PathEl::ClosePath => {
-                if let (Some(prev), Some(s)) = (last, start) {
-                    if (s - prev).hypot2() > 0.0 {
-                        edges.push((prev, s, true, sub));
-                    }
-                }
-                last = start;
-            }
-            _ => {}
-        });
-        close(&mut edges, last, start, sub);
-
+impl EdgeIndex {
+    fn from_edges(edges: Vec<(Point, Point, u32, bool)>) -> EdgeIndex {
         let (mut ymin, mut ymax) = (f64::INFINITY, f64::NEG_INFINITY);
         for (a, b, _, _) in &edges {
             ymin = ymin.min(a.y).min(b.y);
@@ -139,12 +86,11 @@ impl SourceIndex {
         let n_buckets = (edges.len() / 4).clamp(1, 256);
         let mut buckets: Vec<Vec<u32>> = alloc::vec![Vec::new(); n_buckets];
         if edges.is_empty() {
-            return SourceIndex {
+            return EdgeIndex {
                 edges,
                 buckets,
                 y0: 0.0,
                 inv_h: 0.0,
-                flat_tol,
             };
         }
         let inv_h = n_buckets as f64 / (ymax - ymin).max(1e-12);
@@ -155,203 +101,31 @@ impl SourceIndex {
                 bucket.push(i as u32);
             }
         }
-        SourceIndex {
+        EdgeIndex {
             edges,
             buckets,
             y0: ymin,
             inv_h,
-            flat_tol,
         }
     }
 
-    /// The single bucket containing `y`, or `None` when there is no index.
-    fn bucket_of(&self, y: f64) -> Option<&Vec<u32>> {
+    /// The bucket containing `y` (there is always at least one bucket).
+    fn bucket_ix(&self, y: f64) -> usize {
         let n = self.buckets.len();
-        if n == 0 {
-            return None;
-        }
-        let ix = crate::math::floor((y - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64) as usize;
-        Some(&self.buckets[ix])
+        crate::math::floor((y - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64) as usize
     }
 
-    fn bucket_range(&self, lo_y: f64, hi_y: f64) -> (usize, usize) {
-        let n = self.buckets.len();
-        if n == 0 {
-            return (0, 0);
-        }
-        let lo =
-            crate::math::floor((lo_y - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64) as usize;
-        let hi =
-            crate::math::ceil((hi_y - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64) as usize;
-        (lo, hi)
-    }
-
-    /// Whether `p` is at least `sqrt(thresh_sq)` away from contour
-    /// `contour` of the path (`None`: away from the whole path).
-    ///
-    /// Phrased as a predicate rather than a distance: a segment whose box is
-    /// already beyond the threshold cannot disqualify the point, and the
-    /// first violation ends the scan.
-    pub(crate) fn is_clear_of(&self, p: Point, thresh_sq: f64, contour: Option<usize>) -> bool {
-        if thresh_sq <= 0.0 {
-            return true;
-        }
-        let r = crate::math::sqrt(thresh_sq);
-        let (lo, hi) = self.bucket_range(p.y - r, p.y + r);
-        for bi in lo..=hi {
-            for &ix in &self.buckets[bi] {
-                let (a, b, real, sub) = self.edges[ix as usize];
-                if !real || contour.is_some_and(|c| c as u32 != sub) {
-                    continue;
-                }
-                let (x0, x1) = if a.x <= b.x { (a.x, b.x) } else { (b.x, a.x) };
-                let dx = (x0 - p.x).max(p.x - x1).max(0.0);
-                if dx * dx >= thresh_sq {
-                    continue;
-                }
-                let ab = b - a;
-                let len2 = ab.hypot2();
-                let t = if len2 > 0.0 {
-                    ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
-                } else {
-                    0.0
-                };
-                if ((p - a) - t * ab).hypot2() < thresh_sq {
-                    return false;
-                }
-            }
-        }
-        true
-    }
-
-    /// Nonzero winding number of the flattened path at `p`.
+    /// Nonzero winding at `p` of the edges whose tag passes `keep`.
     ///
     /// Exactly one bucket is scanned: an edge crossing `y = p.y` always
     /// spans that bucket, and visiting a neighbour would double-count edges
     /// registered in both — which breaks the cancellation that makes the
     /// winding zero outside the shape.
-    pub(crate) fn winding(&self, p: Point) -> i32 {
-        let Some(bucket) = self.bucket_of(p.y) else {
-            return 0;
-        };
+    fn winding_where(&self, p: Point, keep: impl Fn(u32) -> bool) -> i32 {
         let mut w = 0;
-        for &ix in bucket {
-            let (a, b, _, _) = self.edges[ix as usize];
-            if a.y <= p.y {
-                if b.y > p.y && (b - a).cross(p - a) > 0.0 {
-                    w += 1;
-                }
-            } else if b.y <= p.y && (b - a).cross(p - a) < 0.0 {
-                w -= 1;
-            }
-        }
-        w
-    }
-
-    /// Flattening tolerance, subtracted from distance thresholds.
-    fn slack(&self) -> f64 {
-        self.flat_tol
-    }
-}
-
-/// Flattened raw offset loops with per-edge owner tags.
-///
-/// Backs the cross-contour membership test: a piece of loop `i` belongs to
-/// the region boundary only where the *other* loops' winding matches the
-/// expected value. Distance to the source path cannot express this for
-/// miter/bevel joins, whose loops deviate from the distance-`w` set at
-/// corners (a miter wedge reaches past `w`, and an arc of another contour
-/// hiding inside that wedge must still be pruned).
-struct RawIndex {
-    /// `(a, b, owner)` flattened edges.
-    edges: Vec<(Point, Point, u32)>,
-    buckets: Vec<Vec<u32>>,
-    y0: f64,
-    inv_h: f64,
-}
-
-impl RawIndex {
-    fn new(raws: &[BezPath], flat_tol: f64) -> RawIndex {
-        let mut edges: Vec<(Point, Point, u32)> = Vec::new();
-        for (ix, raw) in raws.iter().enumerate() {
-            let mut last: Option<Point> = None;
-            let mut start: Option<Point> = None;
-            kurbo::flatten(raw.iter(), flat_tol.max(1e-9), |el| match el {
-                PathEl::MoveTo(p) => {
-                    last = Some(p);
-                    start = Some(p);
-                }
-                PathEl::LineTo(p) => {
-                    if let Some(prev) = last {
-                        if (p - prev).hypot2() > 0.0 {
-                            edges.push((prev, p, ix as u32));
-                        }
-                    }
-                    last = Some(p);
-                }
-                PathEl::ClosePath => {
-                    if let (Some(prev), Some(s)) = (last, start) {
-                        if (s - prev).hypot2() > 0.0 {
-                            edges.push((prev, s, ix as u32));
-                        }
-                    }
-                    last = start;
-                }
-                _ => {}
-            });
-            // The raw loops are explicitly closed, but guard anyway.
-            if let (Some(prev), Some(s)) = (last, start) {
-                if (s - prev).hypot2() > 0.0 {
-                    edges.push((prev, s, ix as u32));
-                }
-            }
-        }
-
-        let (mut ymin, mut ymax) = (f64::INFINITY, f64::NEG_INFINITY);
-        for (a, b, _) in &edges {
-            ymin = ymin.min(a.y).min(b.y);
-            ymax = ymax.max(a.y).max(b.y);
-        }
-        let n_buckets = (edges.len() / 4).clamp(1, 256);
-        let mut buckets: Vec<Vec<u32>> = alloc::vec![Vec::new(); n_buckets];
-        if edges.is_empty() {
-            return RawIndex {
-                edges,
-                buckets,
-                y0: 0.0,
-                inv_h: 0.0,
-            };
-        }
-        let inv_h = n_buckets as f64 / (ymax - ymin).max(1e-12);
-        for (i, (a, b, _)) in edges.iter().enumerate() {
-            let lo = (((a.y.min(b.y) - ymin) * inv_h) as usize).min(n_buckets - 1);
-            let hi = (((a.y.max(b.y) - ymin) * inv_h) as usize).min(n_buckets - 1);
-            for bucket in &mut buckets[lo..=hi] {
-                bucket.push(i as u32);
-            }
-        }
-        RawIndex {
-            edges,
-            buckets,
-            y0: ymin,
-            inv_h,
-        }
-    }
-
-    /// Nonzero winding at `p` of every loop except `owner`'s.
-    ///
-    /// Single-bucket scan, same reasoning as [`SourceIndex::winding`].
-    fn winding_excluding(&self, p: Point, owner: usize) -> i32 {
-        let n = self.buckets.len();
-        if n == 0 {
-            return 0;
-        }
-        let ix =
-            crate::math::floor((p.y - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64) as usize;
-        let mut w = 0;
-        for &ei in &self.buckets[ix] {
-            let (a, b, o) = self.edges[ei as usize];
-            if o as usize == owner {
+        for &ix in &self.buckets[self.bucket_ix(p.y)] {
+            let (a, b, tag, _) = self.edges[ix as usize];
+            if !keep(tag) {
                 continue;
             }
             if a.y <= p.y {
@@ -365,26 +139,22 @@ impl RawIndex {
         w
     }
 
-    /// Whether `p` lies within `sqrt(r_sq)` of any loop except `owner`'s.
+    /// Whether any edge passing `keep` lies within `sqrt(r_sq)` of `p`.
     ///
-    /// A piece that close to another loop cannot be classified by winding —
-    /// the loops locally coincide (a donut at exactly half its ring
-    /// thickness) — and is pruned instead, collapsing sub-resolution
-    /// regions to clean saturation.
-    fn is_near_other(&self, p: Point, r_sq: f64, owner: usize) -> bool {
+    /// Phrased as an early-exit scan: an edge whose box is already beyond
+    /// the radius cannot qualify, and the first hit ends it. Callers
+    /// special-case non-positive `r_sq`.
+    fn within_where(&self, p: Point, r_sq: f64, keep: impl Fn(u32, bool) -> bool) -> bool {
         let n = self.buckets.len();
-        if n == 0 || r_sq <= 0.0 {
-            return false;
-        }
         let r = crate::math::sqrt(r_sq);
         let lo = crate::math::floor((p.y - r - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64)
             as usize;
         let hi =
             crate::math::ceil((p.y + r - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64) as usize;
         for bi in lo..=hi {
-            for &ei in &self.buckets[bi] {
-                let (a, b, o) = self.edges[ei as usize];
-                if o as usize == owner {
+            for &ix in &self.buckets[bi] {
+                let (a, b, tag, real) = self.edges[ix as usize];
+                if !keep(tag, real) {
                     continue;
                 }
                 let (x0, x1) = if a.x <= b.x { (a.x, b.x) } else { (b.x, a.x) };
@@ -405,6 +175,176 @@ impl RawIndex {
             }
         }
         false
+    }
+}
+
+/// Source geometry prepared for the two hot predicates: "is this point inside
+/// the region?" and "is it far enough from the path?".
+///
+/// Both would otherwise be a per-curve solve — [`kurbo::Shape::winding`],
+/// [`kurbo::ParamCurveNearest::nearest`] — evaluated once per candidate
+/// piece, which dominates the pipeline. The path is flattened once instead
+/// and its edges bucketed by `y`, so a query touches only the edges that can
+/// matter. Flattening error is folded into the distance threshold.
+///
+/// Edge tags are subpath ordinals, so the distance test can be restricted to
+/// a piece's own contour (cross-contour validity is a winding question, not
+/// a distance one — see `region_loops`).
+pub(crate) struct SourceIndex {
+    index: EdgeIndex,
+    flat_tol: f64,
+}
+
+impl SourceIndex {
+    pub(crate) fn new(path: &BezPath, flat_tol: f64) -> Self {
+        let flat_tol = flat_tol.max(1e-9);
+        let mut edges: Vec<(Point, Point, u32, bool)> = Vec::new();
+        let mut last: Option<Point> = None;
+        let mut start: Option<Point> = None;
+        let mut sub: u32 = 0;
+        let mut seen_move = false;
+        let close = |edges: &mut Vec<(Point, Point, u32, bool)>,
+                     last: Option<Point>,
+                     s: Option<Point>,
+                     sub: u32| {
+            if let (Some(prev), Some(s)) = (last, s) {
+                if (s - prev).hypot2() > 0.0 {
+                    edges.push((prev, s, sub, false));
+                }
+            }
+        };
+        kurbo::flatten(path.iter(), flat_tol, |el| match el {
+            PathEl::MoveTo(p) => {
+                close(&mut edges, last, start, sub);
+                if seen_move {
+                    sub += 1;
+                } else {
+                    seen_move = true;
+                }
+                last = Some(p);
+                start = Some(p);
+            }
+            PathEl::LineTo(p) => {
+                if let Some(prev) = last {
+                    if (p - prev).hypot2() > 0.0 {
+                        edges.push((prev, p, sub, true));
+                    }
+                }
+                last = Some(p);
+            }
+            PathEl::ClosePath => {
+                if let (Some(prev), Some(s)) = (last, start) {
+                    if (s - prev).hypot2() > 0.0 {
+                        edges.push((prev, s, sub, true));
+                    }
+                }
+                last = start;
+            }
+            _ => {}
+        });
+        close(&mut edges, last, start, sub);
+
+        SourceIndex {
+            index: EdgeIndex::from_edges(edges),
+            flat_tol,
+        }
+    }
+
+    /// Whether `p` is at least `sqrt(thresh_sq)` away from contour
+    /// `contour` of the path (`None`: away from the whole path).
+    ///
+    /// Implicit closing chords are not part of the path for distance.
+    pub(crate) fn is_clear_of(&self, p: Point, thresh_sq: f64, contour: Option<usize>) -> bool {
+        if thresh_sq <= 0.0 {
+            return true;
+        }
+        !self.index.within_where(p, thresh_sq, |tag, real| {
+            real && contour.is_none_or(|c| c as u32 == tag)
+        })
+    }
+
+    /// Nonzero winding number of the flattened path at `p` (implicit closing
+    /// chords included).
+    pub(crate) fn winding(&self, p: Point) -> i32 {
+        self.index.winding_where(p, |_| true)
+    }
+
+    /// Flattening tolerance, subtracted from distance thresholds.
+    fn slack(&self) -> f64 {
+        self.flat_tol
+    }
+}
+
+/// Flattened raw offset loops with per-edge owner tags.
+///
+/// Backs the cross-contour membership test: a piece of loop `i` belongs to
+/// the region boundary only where the *other* loops' winding matches the
+/// expected value. Distance to the source path cannot express this for
+/// miter/bevel joins, whose loops deviate from the distance-`w` set at
+/// corners (a miter wedge reaches past `w`, and an arc of another contour
+/// hiding inside that wedge must still be pruned).
+struct RawIndex {
+    index: EdgeIndex,
+}
+
+impl RawIndex {
+    fn new(raws: &[BezPath], flat_tol: f64) -> RawIndex {
+        let mut edges: Vec<(Point, Point, u32, bool)> = Vec::new();
+        for (ix, raw) in raws.iter().enumerate() {
+            let mut last: Option<Point> = None;
+            let mut start: Option<Point> = None;
+            kurbo::flatten(raw.iter(), flat_tol.max(1e-9), |el| match el {
+                PathEl::MoveTo(p) => {
+                    last = Some(p);
+                    start = Some(p);
+                }
+                PathEl::LineTo(p) => {
+                    if let Some(prev) = last {
+                        if (p - prev).hypot2() > 0.0 {
+                            edges.push((prev, p, ix as u32, true));
+                        }
+                    }
+                    last = Some(p);
+                }
+                PathEl::ClosePath => {
+                    if let (Some(prev), Some(s)) = (last, start) {
+                        if (s - prev).hypot2() > 0.0 {
+                            edges.push((prev, s, ix as u32, true));
+                        }
+                    }
+                    last = start;
+                }
+                _ => {}
+            });
+            // The raw loops are explicitly closed, but guard anyway.
+            if let (Some(prev), Some(s)) = (last, start) {
+                if (s - prev).hypot2() > 0.0 {
+                    edges.push((prev, s, ix as u32, true));
+                }
+            }
+        }
+        RawIndex {
+            index: EdgeIndex::from_edges(edges),
+        }
+    }
+
+    /// Nonzero winding at `p` of every loop except `owner`'s.
+    fn winding_excluding(&self, p: Point, owner: usize) -> i32 {
+        self.index.winding_where(p, |tag| tag as usize != owner)
+    }
+
+    /// Whether `p` lies within `sqrt(r_sq)` of any loop except `owner`'s.
+    ///
+    /// A piece that close to another loop cannot be classified by winding —
+    /// the loops locally coincide (a donut at exactly half its ring
+    /// thickness) — and is pruned instead, collapsing sub-resolution
+    /// regions to clean saturation.
+    fn is_near_other(&self, p: Point, r_sq: f64, owner: usize) -> bool {
+        if r_sq <= 0.0 {
+            return false;
+        }
+        self.index
+            .within_where(p, r_sq, |tag, _| tag as usize != owner)
     }
 }
 
@@ -680,12 +620,7 @@ impl CutSegs {
             }
             for j in (i + 1)..n {
                 // Cheap box rejection before the subdivision search.
-                let (a, b) = (bboxes[i], bboxes[j]);
-                if a.x0 > b.x1 + accuracy
-                    || b.x0 > a.x1 + accuracy
-                    || a.y0 > b.y1 + accuracy
-                    || b.y0 > a.y1 + accuracy
-                {
+                if !split::overlaps(bboxes[i], bboxes[j], accuracy) {
                     continue;
                 }
                 let same = owner[i] == owner[j];
@@ -759,7 +694,7 @@ fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64) -> Vec<BezPath> {
         loop {
             used[cur] = true;
             let (owner, seg) = kept[cur].unwrap();
-            append_seg(&mut path, seg);
+            split::append_seg(&mut path, seg);
             let end = seg.end();
             if (end - first_pt).hypot() <= eps {
                 break;
@@ -791,14 +726,6 @@ fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64) -> Vec<BezPath> {
         }
     }
     loops
-}
-
-fn append_seg(path: &mut BezPath, seg: PathSeg) {
-    match seg {
-        PathSeg::Line(l) => path.line_to(l.p1),
-        PathSeg::Quad(q) => path.quad_to(q.p1, q.p2),
-        PathSeg::Cubic(c) => path.curve_to(c.p1, c.p2, c.p3),
-    }
 }
 
 #[cfg(test)]

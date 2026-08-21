@@ -28,7 +28,7 @@ pub(crate) struct Resolved {
     /// The geometric side the band goes on.
     pub side: StrokeSide,
     /// The side facing the filled region (closed, one-sided cases only) —
-    /// used by the extreme-width pair clamp.
+    /// orients the region construction and the dash fill mask.
     pub fill_side: Option<StrokeSide>,
 }
 

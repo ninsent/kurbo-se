@@ -2,15 +2,45 @@
 
 This changelog follows <https://keepachangelog.com/en/>.
 
-## Unreleased
+## 0.1.0 (unreleased)
+
+Initial release, targeting kurbo 0.13.
 
 ### Added
 
+- `StrokeStyle` / `StrokeAlignment` / `StrokeSide` / `DashStyle`: Figma's
+  stroke panel as a style type — alignment (inside/center/outside), raw side
+  override, joins with a **miter angle in degrees**, independent start/end
+  caps, dash pattern/offset/**dash cap**.
+- `stroke_aligned` / `stroke_aligned_with` (+ `AlignedStrokeCtx` for
+  allocation reuse): expand an aligned stroke into a nonzero-rule fill
+  outline. One-sided bands keep the source path as their exact shared
+  boundary; sharp corners are clipped so inside strokes never leak outside
+  the fill (and vice versa).
+- Hole-aware per-subpath side resolution (winding probe): holes stroke into
+  the ring; reversing winding direction never changes the result.
+- Dashing on the centerline with seam-merge on closed contours (smooth
+  `dash_offset` animation), pattern sanitization (empty/negative/zero-sum
+  patterns render solid instead of panicking or hanging), and zero-length
+  dashes rendered as dots (round + oriented square).
+- `miter_angle_to_limit` / `miter_limit_to_angle` conversions.
+- `From<&StrokeStyle> for kurbo::Stroke` escape hatch (centered
+  interpretation, documented lossiness).
+- `analyze_subpaths` introspection for editors/debug tooling.
+- `no_std` support (`libm` feature), `serde` feature, zero `unsafe`.
+- Interactive wasm sandbox (`sandbox/`), headless vello example
+  (`examples/vello-demo`), criterion benchmarks.
+- Golden characterization tests (`tests/golden.rs` + repo-only fixture)
+  pinning the exact outline of a 10-shape × 8-style matrix, as a net for
+  behavior-preserving refactors.
 - Package metadata: author, repository and homepage
   (<https://github.com/ninsent/kurbo-se>), plus `LICENSE-APACHE`,
   `LICENSE-MIT` and `AUTHORS` files.
 
-### Changed
+The sections below record the pre-release development history of the above
+(nothing here was ever published).
+
+### Changed (during development)
 
 - **Aligned strokes on closed contours are now defined set-theoretically**,
   matching Figma: `Inside(w) = { p ∈ F : dist(p, path) ≤ w }` and
@@ -35,7 +65,7 @@ This changelog follows <https://keepachangelog.com/en/>.
   Inside/outside strokes on circles and donuts drop 2–5×, and one-sided
   cost no longer grows as tolerance shrinks.
 
-### Fixed
+### Fixed (during development)
 
 - Centered strokes on closed contours grew holes at extreme weights: past
   `w/2 >` the local thickness the direct band's inner boundary inverts and
@@ -60,6 +90,15 @@ This changelog follows <https://keepachangelog.com/en/>.
   additionally guarded so an unmeasurable (overflow-scale) segment cannot
   stall the phase. Reported upstream as
   [`upstream/04-quad-arclen-nan.md`](upstream/04-quad-arclen-nan.md).
+- *Solid* strokes on paths with underflow-scale segments went non-finite:
+  a delta of ~1e-300 passes an exact point-inequality check but its squared
+  length underflows to zero, so normalizing the tangent divided by zero —
+  only the dash and split stages had the guard. Degenerate segments are now
+  dropped once at input canonicalization, which protects every
+  construction; the synthesized closing chord (created after
+  canonicalization) gets its own underflow-aware gate, and an
+  all-subnormal subpath now renders like a coincident-point one (a dot at
+  most). Measured cost: none.
 - Square dash caps on curved contours shattered each dash into a wedge plus
   a sliver. The cap overshoots the fill on a convex curve, so the mask runs;
   a fill-boundary piece that straddled the end of the band's shared edge was
@@ -130,31 +169,28 @@ This changelog follows <https://keepachangelog.com/en/>.
   the std-only `f64::floor`/`f64::ceil` inherent methods; they now go through
   the crate's float shims. Caught by the CI `no-std` job.
 
-## 0.1.0 (unpublished)
+### Sandbox
 
-Initial release, targeting kurbo 0.13.
+- The dash controls take a full Figma-style pattern (`2, 4, 6, 8`) instead
+  of a single dash/gap pair: even entries are dash lengths, odd entries
+  gaps, odd-length lists read doubled — the semantics the crate always had
+  (`DashStyle::from_pattern`), now reachable from the panel, the shareable
+  URL (`dashes=2,4,6,8`; the old `dash`/`gap` params still parse), and the
+  native-SVG reference overlay (whose `stroke-dasharray` shares the exact
+  semantics, keeping the oracle valid). Pinned crate-side by
+  `tests/dash_pattern.rs`, including the byte-exact odd-doubling
+  equivalence.
 
-### Added
+### Internal (during development)
 
-- `StrokeStyle` / `StrokeAlignment` / `StrokeSide` / `DashStyle`: Figma's
-  stroke panel as a style type — alignment (inside/center/outside), raw side
-  override, joins with a **miter angle in degrees**, independent start/end
-  caps, dash pattern/offset/**dash cap**.
-- `stroke_aligned` / `stroke_aligned_with` (+ `AlignedStrokeCtx` for
-  allocation reuse): expand an aligned stroke into a nonzero-rule fill
-  outline. One-sided bands keep the source path as their exact shared
-  boundary; sharp corners are clipped so inside strokes never leak outside
-  the fill (and vice versa).
-- Hole-aware per-subpath side resolution (winding probe): holes stroke into
-  the ring; reversing winding direction never changes the result.
-- Dashing on the centerline with seam-merge on closed contours (smooth
-  `dash_offset` animation), pattern sanitization (empty/negative/zero-sum
-  patterns render solid instead of panicking or hanging), and zero-length
-  dashes rendered as dots (round + oriented square).
-- `miter_angle_to_limit` / `miter_limit_to_angle` conversions.
-- `From<&StrokeStyle> for kurbo::Stroke` escape hatch (centered
-  interpretation, documented lossiness).
-- `analyze_subpaths` introspection for editors/debug tooling.
-- `no_std` support (`libm` feature), `serde` feature, zero `unsafe`.
-- Interactive wasm sandbox (`sandbox/`), headless vello example
-  (`examples/vello-demo`), criterion benchmarks.
+- The two flattened edge indexes (source path and raw offset loops) now
+  share one `y`-bucketed `EdgeIndex` with filter-parameterized winding and
+  proximity predicates; the region-construction call sites share a common
+  setup helper; small geometry helpers (`append_seg`, `overlaps`,
+  `start_point`) are single-sourced. Removed the vestigial per-piece
+  effective width (a leftover of the pre-region width clamp). No output or
+  measured performance change (golden suite + benches).
+- Documented limitation: a dash pattern whose single dash swallows an
+  entire closed contour (dash ≥ perimeter, zero gap) expands as an
+  unmasked ring and can cross the fill boundary at extreme widths; use a
+  solid stroke instead.

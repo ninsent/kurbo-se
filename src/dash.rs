@@ -212,13 +212,13 @@ fn non_degenerate(els: &[PathEl]) -> impl Iterator<Item = PathEl> + '_ {
     els.iter().copied().filter(move |el| {
         let keep = match (cur, el) {
             (Some(p0), PathEl::LineTo(p)) => {
-                !crate::split::is_degenerate(&PathSeg::Line(Line::new(p0, *p)))
+                !crate::math::is_degenerate(&PathSeg::Line(Line::new(p0, *p)))
             }
             (Some(p0), PathEl::QuadTo(p1, p2)) => {
-                !crate::split::is_degenerate(&PathSeg::Quad(QuadBez::new(p0, *p1, *p2)))
+                !crate::math::is_degenerate(&PathSeg::Quad(QuadBez::new(p0, *p1, *p2)))
             }
             (Some(p0), PathEl::CurveTo(p1, p2, p3)) => {
-                !crate::split::is_degenerate(&PathSeg::Cubic(CubicBez::new(p0, *p1, *p2, *p3)))
+                !crate::math::is_degenerate(&PathSeg::Cubic(CubicBez::new(p0, *p1, *p2, *p3)))
             }
             _ => true,
         };
@@ -275,12 +275,9 @@ fn synthesize_dots(
 
     // Cumulative start positions of "on" entries with zero length, phased by
     // the offset, repeated over the path length.
+    // `offset ∈ [0, period)`, so the cursor starts within one period of 0.
     let mut cursor = -offset;
     let mut i = 0usize;
-    // Walk whole periods until the window [0, total] is covered.
-    while cursor < -period {
-        cursor += period;
-    }
     let mut positions: Vec<f64> = Vec::new();
     let mut guard = 0usize;
     let max_iters = eff_len * (math::ceil(total / period) as usize + 2) + eff_len;

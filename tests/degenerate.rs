@@ -286,6 +286,90 @@ fn zero_length_segments_do_not_break_dashing() {
     }
 }
 
+/// Subnormal-length segments must not poison *solid* strokes (2026-08-21
+/// audit).
+///
+/// A delta of ~1e-300 passes an exact `p1 != p0` check but its squared
+/// length underflows to zero, so normalizing the tangent divided by zero and
+/// the whole outline went non-finite. Dashing and splitting already dropped
+/// such segments; the plain band expansion now applies the same gate. The
+/// output must match the clean path with the segment removed by hand.
+#[test]
+fn subnormal_segments_solid_strokes_stay_finite() {
+    // Open polyline with a subnormal line segment.
+    let mut open_sub = BezPath::new();
+    open_sub.move_to((0.0, 0.0));
+    open_sub.line_to((1e-300, 0.0));
+    open_sub.line_to((10.0, 0.0));
+    open_sub.line_to((10.0, 10.0));
+    let mut open_clean = BezPath::new();
+    open_clean.move_to((0.0, 0.0));
+    open_clean.line_to((10.0, 0.0));
+    open_clean.line_to((10.0, 10.0));
+
+    // Closed rect with a subnormal segment spliced in.
+    let mut closed_sub = BezPath::new();
+    closed_sub.move_to((0.0, 0.0));
+    closed_sub.line_to((1e-300, 0.0));
+    closed_sub.line_to((10.0, 0.0));
+    closed_sub.line_to((10.0, 10.0));
+    closed_sub.line_to((0.0, 10.0));
+    closed_sub.close_path();
+    let closed_clean = kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9);
+
+    // Closed triangle whose *closing chord* is subnormal.
+    let mut seam_sub = BezPath::new();
+    seam_sub.move_to((0.0, 0.0));
+    seam_sub.line_to((10.0, 0.0));
+    seam_sub.line_to((10.0, 10.0));
+    seam_sub.line_to((1e-300, 0.0));
+    seam_sub.close_path();
+
+    matrix(&open_sub, 4.0, "open subnormal");
+    matrix(&closed_sub, 4.0, "closed subnormal");
+    matrix(&seam_sub, 4.0, "subnormal seam");
+
+    for alignment in ALIGNMENTS {
+        let style = StrokeStyle::new(4.0).with_alignment(alignment);
+        for (label, sub, clean) in [
+            ("open", &open_sub, &open_clean),
+            ("closed", &closed_sub, &closed_clean),
+        ] {
+            let a = stroke_aligned(sub, &style, 1e-3);
+            let b = stroke_aligned(clean, &style, 1e-3);
+            assert!(a.is_finite(), "{label}/{alignment:?}: non-finite output");
+            assert!(
+                (a.area().abs() - b.area().abs()).abs() < 1e-6,
+                "{label}/{alignment:?}: area {} differs from clean {}",
+                a.area().abs(),
+                b.area().abs()
+            );
+        }
+    }
+}
+
+/// A subpath whose entire extent is subnormal behaves like a zero-length
+/// one: a dot for centered round caps, nothing otherwise — not NaN.
+#[test]
+fn subnormal_subpath_is_a_dot() {
+    let mut p = BezPath::new();
+    p.move_to((5.0, 5.0));
+    p.line_to((5.0 + 1e-300, 5.0));
+
+    let round = StrokeStyle::new(4.0).with_caps(Cap::Round);
+    let out = stroke_aligned(&p, &round, 1e-4);
+    assert!(
+        (out.area().abs() - std::f64::consts::PI * 4.0).abs() < 0.01,
+        "expected a radius-2 dot, area {}",
+        out.area()
+    );
+
+    let butt = StrokeStyle::new(4.0);
+    assert!(stroke_aligned(&p, &butt, 1e-4).is_empty());
+    let sided = round.clone().with_alignment(StrokeAlignment::Inside);
+    assert!(stroke_aligned(&p, &sided, 1e-4).is_empty());
+}
+
 /// Square dash caps on a curve must not shatter a dash (2026-08-21 report).
 ///
 /// A square cap overshoots the fill on a convex curve, so the fill mask runs.

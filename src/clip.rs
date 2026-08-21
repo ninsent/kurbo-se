@@ -34,7 +34,7 @@ use kurbo::{
 };
 
 use crate::region::SourceIndex;
-use crate::split;
+use crate::split::{self, append_seg, overlaps};
 
 /// The filled region a dashed band is masked by.
 pub(crate) struct ClipSource {
@@ -297,10 +297,6 @@ fn control_box(seg: &PathSeg) -> Rect {
     Rect::new(x0, y0, x1, y1)
 }
 
-fn overlaps(a: Rect, b: Rect, slack: f64) -> bool {
-    !(a.x0 > b.x1 + slack || b.x0 > a.x1 + slack || a.y0 > b.y1 + slack || b.y0 > a.y1 + slack)
-}
-
 fn reverse(seg: PathSeg) -> PathSeg {
     match seg {
         PathSeg::Line(l) => PathSeg::Line(Line::new(l.p1, l.p0)),
@@ -321,7 +317,7 @@ fn stitch(pieces: &[PathSeg], eps: f64, out: &mut BezPath) {
         let mut cur = start;
         loop {
             used[cur] = true;
-            append(&mut loop_path, pieces[cur]);
+            append_seg(&mut loop_path, pieces[cur]);
             let end = pieces[cur].end();
             if (end - first).hypot() <= eps {
                 break;
@@ -337,13 +333,5 @@ fn stitch(pieces: &[PathSeg], eps: f64, out: &mut BezPath) {
         if loop_path.elements().len() >= 4 && loop_path.elements().area().abs() > eps * eps {
             out.extend(loop_path.iter());
         }
-    }
-}
-
-fn append(path: &mut BezPath, seg: PathSeg) {
-    match seg {
-        PathSeg::Line(l) => path.line_to(l.p1),
-        PathSeg::Quad(q) => path.quad_to(q.p1, q.p2),
-        PathSeg::Cubic(c) => path.curve_to(c.p1, c.p2, c.p3),
     }
 }

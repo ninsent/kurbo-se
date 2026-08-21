@@ -24,9 +24,9 @@ let outline = stroke_aligned(shape, &style, 0.1);
 
 | | | |
 |---|---|---|
-| ![inside-aligned star](docs/sandbox-star-inside.png) | ![dashed outside donut](docs/sandbox-donut-dashed.png) | ![saturated star](docs/sandbox-star-saturated.png) |
+| ![inside-aligned star](https://raw.githubusercontent.com/ninsent/kurbo-se/main/docs/sandbox-star-inside.png) | ![dashed outside donut](https://raw.githubusercontent.com/ninsent/kurbo-se/main/docs/sandbox-donut-dashed.png) | ![saturated star](https://raw.githubusercontent.com/ninsent/kurbo-se/main/docs/sandbox-star-saturated.png) |
 | inside-aligned, miter | donut, outside + dashed, round dash caps | past the local thickness the inside stroke saturates |
-| ![bowtie outside](docs/sandbox-bowtie-outside.png) | ![figure-eight outside](docs/sandbox-figure-eight-outside.png) | ![sharp wedge](docs/sandbox-wedge-clip.png) |
+| ![bowtie outside](https://raw.githubusercontent.com/ninsent/kurbo-se/main/docs/sandbox-bowtie-outside.png) | ![figure-eight outside](https://raw.githubusercontent.com/ninsent/kurbo-se/main/docs/sandbox-figure-eight-outside.png) | ![sharp wedge](https://raw.githubusercontent.com/ninsent/kurbo-se/main/docs/sandbox-wedge-clip.png) |
 | self-intersecting: outside never enters the fill | crossing lobes merge into one outside band | a thin wedge fills solid |
 
 ## Feature scope (mirrors Figma's stroke panel)
@@ -119,8 +119,10 @@ mask short-circuits wherever the band leaves the fill by less than
 
 Re-expanding per frame (e.g. animating `dash.offset`) is the supported
 model — no caching layer needed. Use [`stroke_aligned_with`] with a reused
-[`AlignedStrokeCtx`] to keep the hot path allocation-free, mirroring
-kurbo's own `StrokeCtx` pattern.
+[`AlignedStrokeCtx`] so the large expansion buffers keep their capacity
+across calls, mirroring kurbo's own `StrokeCtx` pattern (the region and
+dash-mask stages still make small per-call allocations, included in the
+numbers above).
 
 ## Renderer integration
 
@@ -128,7 +130,7 @@ kurbo-se does CPU-side expansion; so does vello for every dashed stroke
 (see *GPU-friendly Stroke Expansion*, §9.3). `examples/vello-demo` renders
 inside/center/outside stars plus an animated dashed ring headlessly:
 
-![vello demo](docs/vello-demo.png)
+![vello demo](https://raw.githubusercontent.com/ninsent/kurbo-se/main/docs/vello-demo.png)
 
 Measured there: 120 frames at 900×620, scene build *including all stroke
 expansion* averages **0.034 ms**; the full GPU frame averages 1.6 ms. For
@@ -180,6 +182,11 @@ and, gratefully, the design.
   mask tightens accordingly.
 - **Dash phase per subpath:** the pattern restarts at each subpath
   (kurbo/`stroke_with` semantics); browsers continue it across subpaths.
+- **Gap-free "dash" patterns:** a pattern whose single dash swallows an
+  entire closed contour (dash ≥ perimeter, zero gap) expands as an unmasked
+  ring, so at extreme widths it can cross the fill boundary where a solid or
+  genuinely dashed stroke would not. Drop `dash` instead — that pattern
+  means "not dashed".
 - Raw `Shape::area` on stroke outlines over-counts self-overlap pockets;
   measure regions by winding, not by summed signed area.
 

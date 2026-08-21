@@ -9,19 +9,28 @@
 //! `ClosePath` without an intervening `MoveTo` — the new subpath implicitly
 //! starts at the closed subpath's start point. We materialize that `MoveTo`.
 
-use kurbo::{BezPath, PathEl, Point};
+use kurbo::{BezPath, CubicBez, Line, PathEl, PathSeg, Point, QuadBez};
+
+use crate::math;
 
 /// Collect `elements` into `out` (reusing its allocation), canonicalizing
 /// subpath boundaries.
 ///
 /// Guarantees on the result:
 /// - the first element of every subpath is a `MoveTo`;
-/// - `ClosePath` only ever appears as the last element of its subpath.
+/// - `ClosePath` only ever appears as the last element of its subpath;
+/// - no drawing element forms a degenerate segment
+///   ([`math::is_degenerate`]): such segments have no normalizable tangent
+///   and a `NaN` arc length upstream, so every stage would have to skip
+///   them anyway. Dropping them here, once, protects them all. The next
+///   element re-anchors at the previous on-curve point, a sub-resolution
+///   displacement.
 pub(crate) fn collect_canonical(elements: impl Iterator<Item = PathEl>, out: &mut BezPath) {
     out.truncate(0);
     // Start point of the current subpath, used both for the implicit `MoveTo`
     // after a `ClosePath` and for leading-element repair.
     let mut start = Point::ORIGIN;
+    let mut last = Point::ORIGIN;
     let mut seen_moveto = false;
     let mut after_close = false;
     for el in elements {
@@ -29,6 +38,7 @@ pub(crate) fn collect_canonical(elements: impl Iterator<Item = PathEl>, out: &mu
             PathEl::MoveTo(p) => {
                 out.move_to(p);
                 start = p;
+                last = p;
                 seen_moveto = true;
                 after_close = false;
             }
@@ -44,6 +54,7 @@ pub(crate) fn collect_canonical(elements: impl Iterator<Item = PathEl>, out: &mu
                     out.move_to(start);
                 }
                 out.close_path();
+                last = start;
                 after_close = true;
             }
             _ => {
@@ -53,14 +64,30 @@ pub(crate) fn collect_canonical(elements: impl Iterator<Item = PathEl>, out: &mu
                     let p = el.end_point().unwrap_or(Point::ORIGIN);
                     out.move_to(p);
                     start = p;
+                    last = p;
                     seen_moveto = true;
                     continue;
                 }
                 if after_close {
                     out.move_to(start);
+                    last = start;
                     after_close = false;
                 }
+                let degenerate = match el {
+                    PathEl::LineTo(p) => math::is_degenerate(&PathSeg::Line(Line::new(last, p))),
+                    PathEl::QuadTo(p1, p2) => {
+                        math::is_degenerate(&PathSeg::Quad(QuadBez::new(last, p1, p2)))
+                    }
+                    PathEl::CurveTo(p1, p2, p3) => {
+                        math::is_degenerate(&PathSeg::Cubic(CubicBez::new(last, p1, p2, p3)))
+                    }
+                    _ => false, // MoveTo/ClosePath handled above
+                };
+                if degenerate {
+                    continue;
+                }
                 out.push(el);
+                last = el.end_point().unwrap_or(last);
             }
         }
     }
@@ -109,13 +136,20 @@ pub(crate) fn end_point(subpath: &[PathEl]) -> Point {
 }
 
 /// Whether the subpath produces no band geometry: every drawing element sits
-/// exactly on the start point (the expansion skips all of them).
+/// on the start point (the expansion skips all of them).
+///
+/// "On" is underflow-aware, matching [`crate::math::is_degenerate`]: a point
+/// whose offset from the start is too small to square is coincident for
+/// every downstream consumer, so the subpath renders like the exactly
+/// coincident one (a dot at most) instead of feeding the expansion tangents
+/// it cannot normalize.
 pub(crate) fn is_zero_length(subpath: &[PathEl]) -> bool {
     let start = start_point(subpath);
+    let at_start = |p: &Point| (*p - start).hypot2() == 0.0;
     subpath.iter().skip(1).all(|el| match el {
-        PathEl::LineTo(p) => *p == start,
-        PathEl::QuadTo(p1, p2) => *p1 == start && *p2 == start,
-        PathEl::CurveTo(p1, p2, p3) => *p1 == start && *p2 == start && *p3 == start,
+        PathEl::LineTo(p) => at_start(p),
+        PathEl::QuadTo(p1, p2) => at_start(p1) && at_start(p2),
+        PathEl::CurveTo(p1, p2, p3) => at_start(p1) && at_start(p2) && at_start(p3),
         PathEl::ClosePath => true,
         PathEl::MoveTo(_) => false, // not present mid-slice after canonicalization
     })

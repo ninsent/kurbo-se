@@ -18,10 +18,13 @@ use crate::style::{StrokeAlignment, StrokeSide, StrokeStyle};
 /// [`StrokeCtx`](kurbo::StrokeCtx) pattern, which was made public exactly for
 /// this purpose).
 ///
-/// Reusing one context across calls keeps the hot path allocation-free once
-/// the buffers have grown to a working size — the intended usage for
-/// animated `dash_offset` (re-expansion per frame is the supported model; see
-/// the crate docs for measured costs).
+/// Reusing one context across calls lets the large expansion buffers keep
+/// their capacity — the intended usage for animated `dash_offset`
+/// (re-expansion per frame is the supported model; see the crate docs for
+/// measured costs). The direct band path then runs allocation-free; the
+/// region construction and the dash fill mask still make small per-call
+/// allocations (piece lists, flattened indexes), already counted in the
+/// published timings.
 #[derive(Default, Debug)]
 pub struct AlignedStrokeCtx {
     input: BezPath,
@@ -143,7 +146,6 @@ pub fn stroke_aligned_with<'a>(
         crossings: alloc::rc::Rc<[kurbo::Point]>,
         side: StrokeSide,
         fill_side: Option<StrokeSide>,
-        eff_width: f64,
     }
     let no_crossings: alloc::rc::Rc<[kurbo::Point]> = alloc::rc::Rc::from(&[][..]);
     let mut pieces: Vec<Piece> = Vec::new();
@@ -195,7 +197,6 @@ pub fn stroke_aligned_with<'a>(
                         crossings: crossings.clone(),
                         side: StrokeSide::Center,
                         fill_side: None,
-                        eff_width: width,
                     });
                 }
             }
@@ -208,12 +209,11 @@ pub fn stroke_aligned_with<'a>(
                 crossings: no_crossings.clone(),
                 side: StrokeSide::Center,
                 fill_side: None,
-                eff_width: width,
             }),
         }
     }
 
-    // ---- pass 2: resolve sides and clamp effective widths ---------------
+    // ---- pass 2: resolve sides ------------------------------------------
     for piece in &mut pieces {
         let resolved = orient::resolve(
             style.alignment,
@@ -240,7 +240,7 @@ pub fn stroke_aligned_with<'a>(
     let region_ix: Vec<usize> = pieces
         .iter()
         .enumerate()
-        .filter(|(_, p)| p.closed && p.side != StrokeSide::Center && p.eff_width > 0.0)
+        .filter(|(_, p)| p.closed && p.side != StrokeSide::Center)
         .map(|(i, _)| i)
         .collect();
     // The set formulation needs every one-sided closed band to face the fill
@@ -266,45 +266,14 @@ pub fn stroke_aligned_with<'a>(
     let mut region_done = alloc::vec![false; pieces.len()];
     if region_mode {
         let into_fill = uniform_fill_side[0];
-        let width_eff = pieces[region_ix[0]].eff_width;
-        let specs: Vec<crate::region::ContourSpec<'_>> = normalized
-            .iter()
-            .map(|els| crate::region::ContourSpec {
-                els: els.elements(),
-                // Normalisation put the fill to the right of travel for every
-                // contour, outer boundaries and holes alike.
-                fill_side: StrokeSide::Right,
-            })
-            .collect();
-        // The region's predicates must see only the contours participating
-        // in it: an open subpath is banded separately (its one-sided band is
-        // not a distance set), so its proximity must not prune the region
-        // boundary, and its implicit closing chord must not shape the fill.
-        // For all-closed paths this equals the whole input (up to
-        // orientation, which neither predicate observes).
-        let mut region_source = BezPath::new();
-        for els in &normalized {
-            region_source.extend(els.iter());
-        }
-        // Flatten the source once for the distance predicate, finely enough
-        // not to eat into the pruning slack.
-        let index = crate::region::SourceIndex::new(
-            &region_source,
-            (width_eff * 1e-3).max(tolerance * 0.1),
-        );
-        let base = BandParams {
-            d_left: 0.0,
-            d_right: 0.0,
-            join: style.join,
+        let (specs, index, base) = region_setup(
+            &normalized,
+            width,
+            2.0 * tolerance / width,
+            style,
             miter_limit,
-            start_cap: style.start_cap,
-            end_cap: style.end_cap,
             tolerance,
-            join_thresh: 2.0 * tolerance / width_eff,
-            crossings: &[],
-            crossing_eps: 0.0,
-            raw_offset: true,
-        };
+        );
         let kind = if into_fill {
             crate::region::RegionKind::Erosion
         } else {
@@ -314,7 +283,7 @@ pub fn stroke_aligned_with<'a>(
             &specs,
             kind,
             &index,
-            width_eff,
+            width,
             &base,
             split_accuracy,
             left,
@@ -364,14 +333,13 @@ pub fn stroke_aligned_with<'a>(
                 && !region_done[*i]
                 && p.closed
                 && p.side == StrokeSide::Center
-                && p.eff_width > 0.0
                 && crate::split::split_self_intersections(p.els.elements(), true, split_accuracy)
                     .is_none()
         })
         .map(|(i, _)| i)
         .collect();
     if !center_ix.is_empty() {
-        let half = 0.5 * pieces[center_ix[0]].eff_width;
+        let half = 0.5 * width;
         let normalized_c: Vec<BezPath> = center_ix
             .iter()
             .map(|&i| {
@@ -379,32 +347,14 @@ pub fn stroke_aligned_with<'a>(
                 normalize_orientation(&pieces[i].els, fill)
             })
             .collect();
-        let specs: Vec<crate::region::ContourSpec<'_>> = normalized_c
-            .iter()
-            .map(|els| crate::region::ContourSpec {
-                els: els.elements(),
-                fill_side: StrokeSide::Right,
-            })
-            .collect();
-        let mut region_source = BezPath::new();
-        for els in &normalized_c {
-            region_source.extend(els.iter());
-        }
-        let index =
-            crate::region::SourceIndex::new(&region_source, (half * 1e-3).max(tolerance * 0.1));
-        let base = BandParams {
-            d_left: 0.0,
-            d_right: 0.0,
-            join: style.join,
+        let (specs, index, base) = region_setup(
+            &normalized_c,
+            half,
+            2.0 * tolerance / half.max(1e-12),
+            style,
             miter_limit,
-            start_cap: style.start_cap,
-            end_cap: style.end_cap,
             tolerance,
-            join_thresh: 2.0 * tolerance / half.max(1e-12),
-            crossings: &[],
-            crossing_eps: 0.0,
-            raw_offset: true,
-        };
+        );
         let dilation = crate::region::region_loops(
             &specs,
             crate::region::RegionKind::Dilation,
@@ -459,7 +409,7 @@ pub fn stroke_aligned_with<'a>(
     });
 
     for (ix, piece) in pieces.iter().enumerate() {
-        if piece.eff_width <= 0.0 || region_done[ix] {
+        if region_done[ix] {
             continue;
         }
         // Only closed contours have a fill relationship to mask against;
@@ -472,7 +422,7 @@ pub fn stroke_aligned_with<'a>(
             }),
             _ => None,
         };
-        let (d_left, d_right) = orient::side_distances(piece.side, piece.eff_width);
+        let (d_left, d_right) = orient::side_distances(piece.side, width);
         let params = BandParams {
             d_left,
             d_right,
@@ -481,7 +431,7 @@ pub fn stroke_aligned_with<'a>(
             start_cap: style.start_cap,
             end_cap: style.end_cap,
             tolerance,
-            join_thresh: 2.0 * tolerance / piece.eff_width,
+            join_thresh: 2.0 * tolerance / width,
             crossings: &piece.crossings,
             crossing_eps: split_accuracy * 8.0,
             raw_offset: false,
@@ -537,6 +487,62 @@ pub fn stroke_aligned_with<'a>(
     &ctx.output
 }
 
+/// Shared setup for the set-theoretic region construction over `normalized`
+/// contours (fill re-wound to `+1`): per-contour specs, the flattened source
+/// index behind the distance/winding predicates, and raw-offset band
+/// parameters at offset distance `w`.
+///
+/// The predicates must see only the participating contours: an open subpath
+/// is banded separately (its one-sided band is not a distance set), so its
+/// proximity must not prune the region boundary, and its implicit closing
+/// chord must not shape the fill. For all-closed paths this equals the whole
+/// input (up to orientation, which neither predicate observes). The source
+/// is flattened once, finely enough not to eat into the pruning slack.
+///
+/// `join_thresh` is passed in rather than derived: the two call sites
+/// compute it from different quantities (full width vs half).
+fn region_setup<'a>(
+    normalized: &'a [BezPath],
+    w: f64,
+    join_thresh: f64,
+    style: &StrokeStyle,
+    miter_limit: f64,
+    tolerance: f64,
+) -> (
+    Vec<crate::region::ContourSpec<'a>>,
+    crate::region::SourceIndex,
+    BandParams<'static>,
+) {
+    let specs = normalized
+        .iter()
+        .map(|els| crate::region::ContourSpec {
+            els: els.elements(),
+            // Normalisation put the fill to the right of travel for every
+            // contour, outer boundaries and holes alike.
+            fill_side: StrokeSide::Right,
+        })
+        .collect();
+    let mut region_source = BezPath::new();
+    for els in normalized {
+        region_source.extend(els.iter());
+    }
+    let index = crate::region::SourceIndex::new(&region_source, (w * 1e-3).max(tolerance * 0.1));
+    let base = BandParams {
+        d_left: 0.0,
+        d_right: 0.0,
+        join: style.join,
+        miter_limit,
+        start_cap: style.start_cap,
+        end_cap: style.end_cap,
+        tolerance,
+        join_thresh,
+        crossings: &[],
+        crossing_eps: 0.0,
+        raw_offset: true,
+    };
+    (specs, index, base)
+}
+
 /// Re-wind a closed contour so that the filled side lies to the right of
 /// travel — i.e. clockwise for outer-like boundaries, counter-clockwise for
 /// holes (Y-down). The filled set is unchanged; only the winding numbers are
@@ -572,6 +578,11 @@ pub struct SubpathInfo {
 ///
 /// Runs the same canonicalization and side-resolution logic as
 /// [`stroke_aligned`] (winding probe included) without expanding anything.
+///
+/// Granularity: one entry per *input subpath*. A self-intersecting subpath
+/// is reported once, with the side its unsplit contour resolves to;
+/// [`stroke_aligned`] itself goes on to split such a subpath at its
+/// crossings and re-resolve each lobe against the fill independently.
 pub fn analyze_subpaths(
     path: impl Shape,
     style: &StrokeStyle,

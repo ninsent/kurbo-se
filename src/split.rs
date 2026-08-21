@@ -24,7 +24,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use kurbo::{BezPath, ParamCurve, ParamCurveExtrema, PathEl, PathSeg, Point};
+use kurbo::{BezPath, ParamCurve, ParamCurveExtrema, PathEl, PathSeg, Point, Rect};
 
 /// Parametric epsilon for treating a hit as an endpoint touch.
 pub(crate) const T_EPS: f64 = 1e-6;
@@ -73,7 +73,7 @@ pub(crate) fn split_self_intersections(
     // with their neighbours' — the duplicate-vertex pass below would read a
     // run of them as the path revisiting a point and split there.
     let segs: Vec<PathSeg> = kurbo::segments(subpath.iter().copied())
-        .filter(|s| !is_degenerate(s))
+        .filter(|s| !crate::math::is_degenerate(s))
         .collect();
     let n = segs.len();
     if n == 0 {
@@ -115,12 +115,7 @@ pub(crate) fn split_self_intersections(
         for j in (i + 1)..n {
             let adjacent_next = j == i + 1;
             let adjacent_wrap = closed && i == 0 && j == n - 1;
-            let (ba, bb) = (bboxes[i], bboxes[j]);
-            if ba.x0 > bb.x1 + accuracy
-                || bb.x0 > ba.x1 + accuracy
-                || ba.y0 > bb.y1 + accuracy
-                || bb.y0 > ba.y1 + accuracy
-            {
+            if !overlaps(bboxes[i], bboxes[j], accuracy) {
                 continue;
             }
             let hits =
@@ -164,7 +159,7 @@ pub(crate) fn split_self_intersections(
 
     // ---- cut segments into arcs ----
     // Order cuts along the path.
-    cuts.sort_by(|a, b| (a.seg, a.t).partial_cmp(&(b.seg, b.t)).unwrap());
+    cuts.sort_by(|a, b| a.seg.cmp(&b.seg).then(a.t.total_cmp(&b.t)));
     let crossing_points: Vec<Point> = cuts
         .iter()
         .map(|c| segs[c.seg].eval(c.t.clamp(0.0, 1.0)))
@@ -218,7 +213,7 @@ pub(crate) fn split_self_intersections(
     // First arc may lack its MoveTo (starts at path start).
     if let Some(first) = arcs.first_mut() {
         if !matches!(first.els.elements().first(), Some(PathEl::MoveTo(_))) {
-            let start = start_point(subpath);
+            let start = crate::normalize::start_point(subpath);
             let mut with_move = BezPath::new();
             with_move.move_to(start);
             with_move.extend(first.els.iter());
@@ -382,34 +377,9 @@ pub(crate) fn subdivide_at(seg: &PathSeg, ts: &mut Vec<f64>) -> Vec<PathSeg> {
     out
 }
 
-/// Whether a segment covers no distance.
-///
-/// Vanishing *squared* length, not exact coincidence: control deltas small
-/// enough that their squared length underflows to zero make kurbo's
-/// closed-form quad arc length divide zero by zero and return `NaN`, which
-/// then poisons every arc-length accumulator downstream — dash phases become
-/// `NaN` and the output goes non-finite. Such a segment carries no length
-/// either way, so both cases are dropped together.
-pub(crate) fn is_degenerate(seg: &PathSeg) -> bool {
-    match seg {
-        PathSeg::Line(l) => (l.p1 - l.p0).hypot2() == 0.0,
-        PathSeg::Quad(q) => (q.p1 - q.p0).hypot2() == 0.0 && (q.p2 - q.p1).hypot2() == 0.0,
-        PathSeg::Cubic(c) => {
-            (c.p1 - c.p0).hypot2() == 0.0
-                && (c.p2 - c.p1).hypot2() == 0.0
-                && (c.p3 - c.p2).hypot2() == 0.0
-        }
-    }
-}
-
-fn start_point(subpath: &[PathEl]) -> Point {
-    match subpath.first() {
-        Some(PathEl::MoveTo(p)) => *p,
-        _ => Point::ORIGIN,
-    }
-}
-
-fn append_seg(path: &mut BezPath, seg: PathSeg) {
+/// Append `seg` to `path`, starting the path at the segment's start point if
+/// it is empty.
+pub(crate) fn append_seg(path: &mut BezPath, seg: PathSeg) {
     if path.elements().is_empty() {
         path.move_to(seg.start());
     }
@@ -418,6 +388,12 @@ fn append_seg(path: &mut BezPath, seg: PathSeg) {
         PathSeg::Quad(q) => path.quad_to(q.p1, q.p2),
         PathSeg::Cubic(c) => path.curve_to(c.p1, c.p2, c.p3),
     }
+}
+
+/// Whether two boxes come within `slack` of touching.
+#[inline]
+pub(crate) fn overlaps(a: Rect, b: Rect, slack: f64) -> bool {
+    !(a.x0 > b.x1 + slack || b.x0 > a.x1 + slack || a.y0 > b.y1 + slack || b.y0 > a.y1 + slack)
 }
 
 /// Distance from a segment's control points to its chord (flatness).
@@ -486,7 +462,7 @@ fn seg_self_intersections(seg: &PathSeg, accuracy: f64) -> Vec<(f64, f64)> {
 }
 
 fn dedupe(hits: &mut Vec<(f64, f64)>) {
-    hits.sort_by(|x, y| x.partial_cmp(y).unwrap());
+    hits.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)));
     hits.dedup_by(|a, b| (a.0 - b.0).abs() < DEDUP_EPS && (a.1 - b.1).abs() < DEDUP_EPS);
 }
 

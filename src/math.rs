@@ -8,8 +8,6 @@
 //! feature unification by unrelated dependencies could flip that from under
 //! us. A local shim keeps kurbo-se's build self-contained.
 
-#![allow(dead_code)] // some shims are used only by later modules
-
 #[inline]
 pub(crate) fn sin(x: f64) -> f64 {
     #[cfg(feature = "std")]
@@ -103,6 +101,29 @@ pub(crate) fn rem_euclid(x: f64, rhs: f64) -> f64 {
     if r < 0.0 { r + abs(rhs) } else { r }
 }
 
+/// Whether a segment covers no distance.
+///
+/// Vanishing *squared* length, not exact coincidence: control deltas small
+/// enough that their squared length underflows to zero are not
+/// point-coincident, but they carry no usable direction either — normalizing
+/// such a tangent divides by zero, and kurbo's closed-form quad arc length
+/// returns `NaN` for them (see [`arclen`]). Both cases are dropped together
+/// wherever segments are consumed: band expansion, dashing, and
+/// self-intersection splitting (where runs of them would also read as the
+/// path revisiting a vertex).
+#[inline]
+pub(crate) fn is_degenerate(seg: &kurbo::PathSeg) -> bool {
+    match seg {
+        kurbo::PathSeg::Line(l) => (l.p1 - l.p0).hypot2() == 0.0,
+        kurbo::PathSeg::Quad(q) => (q.p1 - q.p0).hypot2() == 0.0 && (q.p2 - q.p1).hypot2() == 0.0,
+        kurbo::PathSeg::Cubic(c) => {
+            (c.p1 - c.p0).hypot2() == 0.0
+                && (c.p2 - c.p1).hypot2() == 0.0
+                && (c.p3 - c.p2).hypot2() == 0.0
+        }
+    }
+}
+
 /// Arc length of a path segment, guarded against non-finite results.
 ///
 /// `QuadBez::arclen` has a closed form that divides by the squared derivative
@@ -114,7 +135,7 @@ pub(crate) fn rem_euclid(x: f64, rhs: f64) -> f64 {
 /// uninterrupted dash.
 ///
 /// Vanishing segments are dropped before they get here (see
-/// [`crate::split::is_degenerate`]); this covers the overflow end, where the
+/// [`is_degenerate`]); this covers the overflow end, where the
 /// segment has real length that simply cannot be measured. Substituting `0`
 /// keeps the phase finite so the rest of the path still dashes.
 #[inline]
