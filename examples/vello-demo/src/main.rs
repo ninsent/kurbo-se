@@ -70,10 +70,12 @@ fn build_scene(scene: &mut Scene, dash_offset: f64, ctx: &mut AlignedStrokeCtx) 
     // re-dashed and re-expanded every frame through the reused context.
     let ring = Circle::new((450.0, 450.0), 130.0);
     scene.fill(Fill::NonZero, Affine::IDENTITY, fill_color, None, &ring.to_path(1e-3));
-    let style = StrokeStyle::new(14.0)
+    // Round dash caps add half the weight at each end, so a dash grows by a
+    // full weight: the gap has to exceed it for the dashes to read apart.
+    let style = StrokeStyle::new(10.0)
         .with_alignment(StrokeAlignment::Inside)
         .with_dash(
-            DashStyle::new(26.0, 14.0)
+            DashStyle::new(26.0, 20.0)
                 .with_offset(dash_offset)
                 .with_cap(Cap::Round),
         );
