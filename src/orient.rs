@@ -2,18 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
 //! Per-subpath side resolution: mapping user-facing alignment onto a
-//! geometric left/right side.
+//! geometric left or right side.
 //!
-//! Conventions (see crate docs): Y-down, unit normal `n̂ = t̂.turn_90()` points
-//! right of travel, positive signed area = clockwise, so a positive-area
-//! subpath has its own interior ("own disk") on the right of travel.
+//! The crate docs give the conventions. Y-down, the unit normal
+//! `n̂ = t̂.turn_90()` points right of travel, and positive signed area means
+//! clockwise, so a positive-area subpath has its own interior — its "own
+//! disk" — on the right of travel.
 //!
-//! For closed subpaths, `Inside` means the side of the *filled region* of the
-//! whole compound path under the nonzero rule. The own-disk rule (area sign)
-//! answers that for outer boundaries but inverts it for holes, so we probe
-//! the actual fill: a point just inside the subpath's own disk has nonzero
-//! whole-path winding iff the own disk is filled there. Holes stroke into the
-//! ring, and reversing winding directions changes nothing.
+//! For closed subpaths, `Inside` means the side of the filled region of the
+//! whole compound path under the nonzero rule. The own-disk rule from the
+//! area sign answers that for outer boundaries, but inverts it for holes,
+//! so the actual fill gets probed instead: a point just inside the
+//! subpath's own disk has nonzero whole-path winding exactly when the own
+//! disk is filled there. Holes then stroke into the ring, and reversing
+//! winding directions changes nothing.
 
 use kurbo::{BezPath, ParamCurve, ParamCurveExtrema, PathEl, Point, Shape, Vec2};
 
@@ -41,8 +43,7 @@ pub(crate) fn resolve(
     whole: &BezPath,
     probe_scale: f64,
 ) -> Resolved {
-    // The fill probe is needed both for alignment resolution and for the
-    // hole-aware width clamp, but only for closed one-sided bands.
+    // The fill probe is only needed for closed one-sided bands.
     let wants_one_sided = matches!(side_override, Some(StrokeSide::Left | StrokeSide::Right))
         || (side_override.is_none()
             && matches!(
@@ -109,8 +110,8 @@ impl StrokeSide {
 
 /// Which side of a closed subpath faces the filled region of `whole`.
 pub(crate) fn fill_side(subpath: &[PathEl], whole: &BezPath, probe_scale: f64) -> StrokeSide {
-    // Own-disk side from the subpath's signed area (closing chord included:
-    // the slice ends with ClosePath, so `segments` emits it).
+    // Own-disk side from the subpath's signed area. The closing chord
+    // counts: the slice ends with ClosePath, so `segments` emits it.
     let own_disk_right = subpath.area() >= 0.0;
     let own_disk = if own_disk_right {
         StrokeSide::Right
@@ -131,18 +132,18 @@ pub(crate) fn fill_side(subpath: &[PathEl], whole: &BezPath, probe_scale: f64) -
             }
         }
     }
-    // Degenerate geometry (zero-size path, sub-delta features): fall back to
-    // the own-disk rule. Deterministic, documented.
+    // Degenerate geometry — a zero-size path, or features smaller than the
+    // probe delta — falls back to the own-disk rule. Deterministic.
     own_disk
 }
 
 /// A point verified to lie inside the subpath's own disk.
 ///
-/// Candidates are the topmost points of the subpath (curve extrema and
-/// segment endpoints, ascending in y). At a topmost point the subpath's
-/// interior lies locally below, so `candidate + (0, δ)` is inside — verified
-/// against the subpath's own winding to survive corners, flat tops, and
-/// spikes thinner than δ.
+/// The candidates are the topmost points of the subpath: curve extrema and
+/// segment endpoints, ascending in y. At a topmost point the interior lies
+/// locally below, so `candidate + (0, δ)` is inside. Each candidate is
+/// checked against the subpath's own winding, which is what makes this
+/// survive corners, flat tops, and spikes thinner than δ.
 fn probe_point(subpath: &[PathEl], delta: f64) -> Option<Point> {
     let mut candidates: [Point; MAX_PROBE_CANDIDATES] = [Point::ORIGIN; MAX_PROBE_CANDIDATES];
     let mut n = 0;

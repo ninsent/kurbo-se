@@ -1,13 +1,16 @@
 // Copyright 2026 the kurbo-se Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Winding-based region properties:
-//! - inside-aligned strokes never leave the source fill; outside-aligned
-//!   never enter it (verified numerically on sample grids, not by eye);
+//! Winding-based region properties, sampled numerically rather than judged
+//! by eye:
+//!
+//! - an inside-aligned stroke never leaves the source fill, and an
+//!   outside-aligned one never enters it;
 //! - inside(w) ∪ outside(w) ≈ center(2w) as regions;
 //! - reversing subpath winding leaves Inside/Outside output unchanged;
-//! - no panics / NaN / hangs on randomized paths (deterministic xorshift,
-//!   watchdog per case, given upstream's history of offset loops).
+//! - randomized paths produce no panics, no NaN, and no hangs. The
+//!   generator is a deterministic xorshift, and each case runs under a
+//!   watchdog, since upstream offset code has a history of infinite loops.
 
 use std::sync::mpsc;
 use std::time::Duration;
@@ -29,9 +32,9 @@ fn winding_grid(path: &BezPath, bbox: Rect, n: usize) -> Vec<bool> {
 }
 
 /// Distance-to-boundary fudge: mismatches are tolerated only for cells whose
-/// center could plausibly sit within `fringe` of a region boundary. Instead
-/// of computing true distances (expensive), allow a bounded mismatch count
-/// proportional to the perimeter/cell ratio.
+/// center could plausibly sit near a region boundary. Instead of computing
+/// true distances (expensive), allow a bounded mismatch count proportional
+/// to the perimeter/cell ratio.
 fn assert_grids_agree(a: &[bool], b: &[bool], n: usize, max_mismatch_frac: f64, label: &str) {
     let mismatches = a.iter().zip(b).filter(|(x, y)| x != y).count();
     let max = ((n * n) as f64 * max_mismatch_frac).ceil() as usize;
@@ -70,7 +73,7 @@ fn shapes() -> Vec<(&'static str, BezPath)> {
     ]
 }
 
-/// `DoD` #4, first half: inside stroke ⊆ source fill.
+/// Inside stroke ⊆ source fill.
 #[test]
 fn inside_stays_inside() {
     for (name, src) in shapes() {
@@ -92,7 +95,7 @@ fn inside_stays_inside() {
     }
 }
 
-/// `DoD` #4, second half: outside stroke ∩ source fill = ∅.
+/// Outside stroke ∩ source fill = ∅.
 #[test]
 fn outside_stays_outside() {
     for (name, src) in shapes() {
@@ -147,7 +150,7 @@ fn inside_union_outside_is_center_doubled() {
     }
 }
 
-/// `DoD` #5: winding reversal changes nothing, as regions.
+/// Winding reversal changes nothing, as regions.
 #[test]
 fn reversal_invariance_as_regions() {
     for (name, src) in shapes() {
@@ -165,9 +168,9 @@ fn reversal_invariance_as_regions() {
     }
 }
 
-/// Deterministic fuzz with a watchdog. Each case runs on its own thread with
-/// a hard timeout — upstream offset code has a history of infinite loops
-/// (kurbo #344), and "no hang" is part of the contract.
+/// Deterministic fuzz with a watchdog. Each case runs on its own thread
+/// under a hard timeout: upstream offset code has a history of infinite
+/// loops (kurbo #344), and "no hang" is part of the contract.
 #[test]
 fn randomized_paths_no_panic_no_hang() {
     let mut rng = 0x2545F4914F6CDD1Du64;

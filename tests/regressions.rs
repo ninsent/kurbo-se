@@ -1,8 +1,8 @@
 // Copyright 2026 the kurbo-se Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Regression ports: adversarial inputs from upstream kurbo/vello reports,
-//! run through the full kurbo-se pipeline at every alignment.
+//! Regression ports: adversarial inputs from upstream kurbo and vello
+//! reports, run through the full pipeline at every alignment.
 //!
 //! Sources:
 //! - kurbo #344 (still open upstream against the old offset pipeline)

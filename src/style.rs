@@ -12,13 +12,14 @@ pub(crate) const DEFAULT_MITER_ANGLE: f64 = 28.96;
 
 /// Where the stroke band sits relative to the path, in user-facing terms.
 ///
-/// For **closed** subpaths, `Inside`/`Outside` refer to the filled region of
-/// the whole path (nonzero winding): holes stroke into the solid ring, and
-/// reversing a subpath's winding direction does not change the result.
+/// For closed subpaths, `Inside` and `Outside` refer to the filled region
+/// of the whole path under nonzero winding. Holes stroke into the solid
+/// ring, and reversing a subpath's winding direction does not change the
+/// result.
 ///
-/// For **open** subpaths the notion is geometrically undefined; kurbo-se maps
+/// For open subpaths the notion is geometrically undefined. kurbo-se maps
 /// `Inside` to [`StrokeSide::Right`] and `Outside` to [`StrokeSide::Left`],
-/// relative to the travel direction (Y-down coordinates). Use
+/// relative to the travel direction in Y-down coordinates. Use
 /// [`StrokeStyle::side`] to control the side explicitly.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -55,32 +56,32 @@ pub enum StrokeSide {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DashStyle {
-    /// Alternating dash/gap lengths, Figma-style: entries at **even indices
-    /// are dash lengths**, entries at **odd indices are gaps**. Arbitrary
-    /// length; an odd-length pattern behaves as if read twice
-    /// (`2, 7, 4` ≡ `2, 7, 4, 2, 7, 4` — SVG semantics), so dashes and gaps
-    /// never swap roles as the pattern repeats.
+    /// Alternating dash/gap lengths, Figma-style. Entries at even indices
+    /// are dash lengths; entries at odd indices are gaps. Any length is
+    /// allowed. An odd-length pattern behaves as if read twice, per SVG:
+    /// `2, 7, 4` equals `2, 7, 4, 2, 7, 4`, so dashes and gaps never swap
+    /// roles as the pattern repeats.
     ///
-    /// Entries must be finite and `>= 0` with a positive sum; patterns that
-    /// violate this are treated as *solid* (documented fallback, kurbo's raw
-    /// `dash` would panic or hang on them).
+    /// Entries must be finite and `>= 0` with a positive sum. Patterns that
+    /// violate this render solid; kurbo's raw `dash` would panic or hang on
+    /// them.
     pub pattern: Dashes,
     /// Phase shift into the pattern, in path-length units. Any finite value;
     /// normalized like SVG's `stroke-dashoffset` (negative values wrap).
     pub offset: f64,
     /// Cap applied to the edges created by dashing.
     ///
-    /// The true endpoints of an open path keep [`StrokeStyle::start_cap`] /
-    /// [`StrokeStyle::end_cap`]; every dash-generated edge uses this cap.
-    /// Zero-length dashes render as dots for `Round` (circle) and `Square`
-    /// (oriented square); `Butt` renders nothing.
+    /// The true endpoints of an open path keep [`StrokeStyle::start_cap`]
+    /// and [`StrokeStyle::end_cap`]; every dash-generated edge uses this
+    /// cap. Zero-length dashes render as dots: a circle for `Round`, an
+    /// oriented square for `Square`. `Butt` renders nothing for them.
     ///
     /// Known limitation: a pattern whose single dash swallows an entire
-    /// closed contour (dash length ≥ perimeter with a zero gap) expands as
-    /// an unmasked ring, so at widths beyond the local thickness it can
-    /// cross the fill boundary where a genuinely dashed or solid stroke
-    /// would not. Such a pattern means "not actually dashed" — drop `dash`
-    /// instead to get the solid construction.
+    /// closed contour (dash length ≥ perimeter, zero gap) expands as an
+    /// unmasked ring. At widths beyond the local thickness it can cross the
+    /// fill boundary where a genuinely dashed or solid stroke would not.
+    /// Such a pattern means "not dashed"; drop `dash` instead to get the
+    /// solid construction.
     pub cap: Cap,
 }
 
@@ -129,9 +130,10 @@ impl DashStyle {
 
 /// The visual style of an aligned stroke, mirroring Figma's stroke panel.
 ///
-/// Defaults (via [`StrokeStyle::new`]) follow Figma's panel — `Miter` join at
-/// a 28.96° miter angle, `Butt` caps, centered, solid — which intentionally
-/// differ from [`kurbo::Stroke`]'s defaults (`Round` join and caps).
+/// The defaults from [`StrokeStyle::new`] follow Figma's panel: `Miter`
+/// join at a 28.96° miter angle, `Butt` caps, centered, solid. They
+/// intentionally differ from [`kurbo::Stroke`]'s defaults, which use
+/// `Round` joins and caps.
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct StrokeStyle {
@@ -151,8 +153,8 @@ pub struct StrokeStyle {
     /// Corner angle in degrees (`0..=180`) at or below which a miter join
     /// falls back to bevel. Converted internally with
     /// [`miter_angle_to_limit`]. Only meaningful when [`join`] is
-    /// [`Join::Miter`]; the value is retained (Figma-style) when the join is
-    /// switched away and back.
+    /// [`Join::Miter`]. The value is retained when the join is switched
+    /// away and back, as in Figma.
     ///
     /// [`join`]: StrokeStyle::join
     pub miter_angle: f64,
@@ -258,13 +260,14 @@ const MITER_LIMIT_CLAMP: f64 = 1e9;
 /// Convert a corner angle in degrees to the equivalent miter limit.
 ///
 /// The relation is exact: `limit = 1 / sin(angle / 2)`. Corners whose
-/// interior angle is *at or below* `angle_deg` render as bevel; sharper
+/// interior angle is at or below `angle_deg` render as bevel. Sharper
 /// corners keep the miter spike.
 ///
-/// Clamping: the input is clamped to `[0, 180]`; `angle → 0` would give an
-/// infinite limit and is capped at `1e9` (everything miters); `angle = 180`
-/// gives `1.0` (everything bevels). Non-finite input debug-asserts and falls
-/// back to the default angle (28.96°, limit ≈ 4).
+/// The input is clamped to `[0, 180]`. An angle of 0 would give an
+/// infinite limit and is capped at `1e9`, where every representable corner
+/// miters. An angle of 180 gives `1.0`, where everything bevels.
+/// Non-finite input debug-asserts and falls back to the default angle
+/// (28.96°, limit ≈ 4).
 ///
 /// ```
 /// let limit = kurbo_se::miter_angle_to_limit(28.96);
@@ -287,8 +290,8 @@ pub fn miter_angle_to_limit(angle_deg: f64) -> f64 {
 /// Convert a miter limit to the equivalent corner angle in degrees.
 ///
 /// Inverse of [`miter_angle_to_limit`]: `angle = 2·asin(1/limit)`. Limits
-/// below `1` are treated as `1` (yielding 180°: everything bevels); an
-/// infinite limit yields `0`. Non-finite (other than `+∞`) debug-asserts and
+/// below `1` are treated as `1`, which yields 180° (everything bevels). An
+/// infinite limit yields `0`. Any other non-finite input debug-asserts and
 /// returns the default angle.
 ///
 /// ```
@@ -309,13 +312,13 @@ pub fn miter_limit_to_angle(limit: f64) -> f64 {
 
 /// Centered interpretation of a [`StrokeStyle`] for kurbo-native stroking.
 ///
-/// This is the escape hatch for callers that only need `Center` alignment and
-/// want a renderer's built-in stroker. The conversion is lossy, field by
-/// field:
+/// The escape hatch for callers that only need `Center` alignment and want
+/// a renderer's built-in stroker. The conversion is lossy:
 ///
-/// - `alignment` / `side` are **ignored** (kurbo strokes are always centered);
-/// - `dash.cap` is **dropped** — kurbo caps dashes with the start/end caps;
-/// - everything else maps 1:1 (`miter_angle` via [`miter_angle_to_limit`]).
+/// - `alignment` and `side` are ignored; kurbo strokes are always centered.
+/// - `dash.cap` is dropped; kurbo caps dashes with the start/end caps.
+/// - Everything else maps 1:1, with `miter_angle` converted through
+///   [`miter_angle_to_limit`].
 impl From<&StrokeStyle> for Stroke {
     fn from(s: &StrokeStyle) -> Stroke {
         let mut stroke = Stroke::new(s.width)

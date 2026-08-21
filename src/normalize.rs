@@ -4,10 +4,11 @@
 //! Input canonicalization and subpath inspection helpers.
 //!
 //! The expansion pipeline wants a stream where every subpath is cleanly
-//! delimited: it starts with a `MoveTo` and contains at most one `ClosePath`,
-//! as its final element. SVG (and kurbo's stroker) allow segments to follow a
-//! `ClosePath` without an intervening `MoveTo` — the new subpath implicitly
-//! starts at the closed subpath's start point. We materialize that `MoveTo`.
+//! delimited: it starts with a `MoveTo` and contains at most one
+//! `ClosePath`, as its final element. SVG, and kurbo's stroker, allow
+//! segments to follow a `ClosePath` with no intervening `MoveTo`; the new
+//! subpath then implicitly starts at the closed subpath's start point.
+//! That implicit `MoveTo` gets materialized here.
 
 use kurbo::{BezPath, CubicBez, Line, PathEl, PathSeg, Point, QuadBez};
 
@@ -19,12 +20,12 @@ use crate::math;
 /// Guarantees on the result:
 /// - the first element of every subpath is a `MoveTo`;
 /// - `ClosePath` only ever appears as the last element of its subpath;
-/// - no drawing element forms a degenerate segment
-///   ([`math::is_degenerate`]): such segments have no normalizable tangent
+/// - no drawing element forms a degenerate segment, as judged by
+///   [`math::is_degenerate`]. Such segments have no normalizable tangent
 ///   and a `NaN` arc length upstream, so every stage would have to skip
-///   them anyway. Dropping them here, once, protects them all. The next
-///   element re-anchors at the previous on-curve point, a sub-resolution
-///   displacement.
+///   them anyway; dropping them here, once, protects all of them. The next
+///   element re-anchors at the previous on-curve point, which moves it by
+///   less than the pipeline can resolve.
 pub(crate) fn collect_canonical(elements: impl Iterator<Item = PathEl>, out: &mut BezPath) {
     out.truncate(0);
     // Start point of the current subpath, used both for the implicit `MoveTo`
@@ -95,9 +96,9 @@ pub(crate) fn collect_canonical(elements: impl Iterator<Item = PathEl>, out: &mu
 
 /// Iterator over subpath slices of a canonicalized element list.
 ///
-/// Same splitting rule as `BezPath::subpaths` (a new subpath begins at each
-/// `MoveTo`), reimplemented over a plain slice so the caller can hold the
-/// backing `BezPath` inside a context struct.
+/// Same splitting rule as `BezPath::subpaths`, where a new subpath begins
+/// at each `MoveTo`. It is reimplemented over a plain slice so the caller
+/// can keep the backing `BezPath` inside a context struct.
 pub(crate) fn subpaths(elements: &[PathEl]) -> impl Iterator<Item = &[PathEl]> {
     let mut i = 0;
     core::iter::from_fn(move || {
@@ -135,14 +136,14 @@ pub(crate) fn end_point(subpath: &[PathEl]) -> Point {
     }
 }
 
-/// Whether the subpath produces no band geometry: every drawing element sits
-/// on the start point (the expansion skips all of them).
+/// Whether the subpath produces no band geometry, because every drawing
+/// element sits on the start point and the expansion skips all of them.
 ///
-/// "On" is underflow-aware, matching [`crate::math::is_degenerate`]: a point
-/// whose offset from the start is too small to square is coincident for
-/// every downstream consumer, so the subpath renders like the exactly
-/// coincident one (a dot at most) instead of feeding the expansion tangents
-/// it cannot normalize.
+/// "On" is underflow-aware, matching [`crate::math::is_degenerate`]. A
+/// point whose offset from the start is too small to square is coincident
+/// as far as every downstream consumer is concerned, so such a subpath
+/// renders like the exactly coincident one — a dot at most — instead of
+/// feeding the expansion tangents it cannot normalize.
 pub(crate) fn is_zero_length(subpath: &[PathEl]) -> bool {
     let start = start_point(subpath);
     let at_start = |p: &Point| (*p - start).hypot2() == 0.0;

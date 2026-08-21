@@ -1,16 +1,17 @@
 // Copyright 2026 the kurbo-se Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Dashing pipeline: pattern sanitization, per-subpath orchestration of
-//! `kurbo::dash`, cap bookkeeping, and dot synthesis for zero-length dashes.
+//! Dashing: pattern sanitization, per-subpath orchestration of
+//! `kurbo::dash`, cap bookkeeping, and dot synthesis for zero-length
+//! dashes.
 //!
-//! Ordering contract: the side is resolved from the *undashed*
-//! subpath by the caller; dashes are cut from the original centerline so
-//! their lengths never distort with alignment; each dash is expanded
-//! independently; interior dash edges wear the dash cap while the true
-//! endpoints of an open subpath keep the style's start/end caps. Closed
-//! contours use kurbo's default seam-merge, so a dash spanning the seam stays
-//! one piece and animating the offset never pops.
+//! The ordering is load-bearing. The caller resolves the side from the
+//! undashed subpath. Dashes are cut from the original centerline, so their
+//! lengths never distort with alignment. Each dash is then expanded on its
+//! own. Interior dash edges wear the dash cap, while the true endpoints of
+//! an open subpath keep the style's start and end caps. Closed contours use
+//! kurbo's default seam-merge, so a dash spanning the seam stays one piece
+//! and animating the offset never pops.
 
 use alloc::vec::Vec;
 
@@ -39,13 +40,13 @@ const DASH_ACCURACY: f64 = 1e-6;
 /// A validated dash configuration.
 ///
 /// kurbo's raw `dash()` panics on an empty pattern and can loop forever on
-/// patterns with negative sums; anything unusable is mapped to `None`
-/// (= solid) instead, per the documented contract.
+/// patterns with negative sums. Anything unusable maps to `None`, which
+/// renders solid, per the crate's documented contract.
 pub(crate) struct SanitizedDash<'a> {
     pub pattern: &'a [f64],
     pub offset: f64,
     pub cap: Cap,
-    /// Any zero-length "on" entries present (dots to synthesize)?
+    /// Whether the pattern has zero-length "on" entries, which become dots.
     pub has_zero_dashes: bool,
 }
 
@@ -70,7 +71,7 @@ pub(crate) fn sanitize(dash: &DashStyle) -> Option<SanitizedDash<'_>> {
         debug_assert!(false, "dash offset must be finite, got {}", dash.offset);
         0.0
     };
-    // "On" entries sit at even indices; with an odd-length pattern the
+    // "On" entries sit at even indices. With an odd-length pattern the
     // repetition flips parity, so every entry takes both roles.
     let has_zero_dashes = pattern
         .iter()
@@ -84,15 +85,17 @@ pub(crate) fn sanitize(dash: &DashStyle) -> Option<SanitizedDash<'_>> {
     })
 }
 
-/// Dash one subpath (or split piece) and expand every dash with the given
-/// band parameters.
+/// Dash one subpath, or one split piece, and expand every dash with the
+/// given band parameters.
 ///
-/// `params.start_cap`/`end_cap` are the *style's* end caps; they are applied
-/// only to the leading/trailing edge of the dashes that touch `true_start` /
-/// `true_end` (the original subpath's endpoints — `None` when this piece has
-/// none, e.g. arcs cut at crossings). Everything else gets `dash.cap`.
+/// `params.start_cap` and `end_cap` are the style's end caps. They apply
+/// only to the leading or trailing edge of the dashes that touch
+/// `true_start` and `true_end`, the original subpath's endpoints. Those are
+/// `None` when this piece has no true endpoint, as for an arc cut at a
+/// crossing. Every other dash edge gets `dash.cap`.
+///
 /// `phase_shift` is the piece's arc-length start in the original subpath,
-/// keeping the pattern phase continuous across split pieces.
+/// which keeps the pattern phase continuous across split pieces.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expand_dashed_subpath(
     subpath: &[PathEl],
@@ -112,11 +115,12 @@ pub(crate) fn expand_dashed_subpath(
 ) {
     let offset = dash.offset - phase_shift;
 
-    // Zero-length dashes are synthesized as dots (the dash stream represents
-    // them as tangent-less degenerate pairs). Arc-length cutting noise can
-    // fatten an exact-zero dash into a ~1e-9 sliver whose caps would render a
-    // duplicate dot, so with zeros in the pattern, negligibly short dash
-    // groups are dropped in favor of the synthesized dot at that position.
+    // Zero-length dashes become dots, synthesized separately: the dash
+    // stream represents them as degenerate pairs with no tangent.
+    // Arc-length cutting noise can fatten an exact-zero dash into a sliver
+    // around 1e-9 long, whose caps would render a duplicate dot. So when
+    // the pattern contains zeros, negligibly short dash groups are dropped
+    // in favour of the synthesized dot at that position.
     let mut tiny_group_threshold = 0.0;
     if dash.has_zero_dashes && dash.cap != Cap::Butt {
         let total: f64 = kurbo::segments(non_degenerate(subpath))
@@ -134,9 +138,10 @@ pub(crate) fn expand_dashed_subpath(
         tiny_group_threshold = 1e-6 * total.max(1.0);
     }
 
-    // Stream the dashed elements, grouping per dash (each dash starts with a
-    // MoveTo). kurbo may emit the arclen-0 dash last (seam-merge stash), so
-    // caps are assigned geometrically, not by position.
+    // Stream the dashed elements, grouping per dash; each dash starts with
+    // a MoveTo. kurbo may emit the zero-length dash last, out of its
+    // seam-merge stash, so caps are assigned geometrically rather than by
+    // position in the stream.
     let mut flush = |group: &mut Vec<PathEl>| {
         if group.is_empty() {
             return;
@@ -170,7 +175,7 @@ pub(crate) fn expand_dashed_subpath(
         }
         match clip {
             // Expand into a scratch buffer so the mask sees one dash at a
-            // time, then intersect it with (or subtract it from) the fill.
+            // time, then intersect it with the fill, or subtract it.
             Some(c) => {
                 band_buf.truncate(0);
                 {
@@ -203,9 +208,9 @@ pub(crate) fn expand_dashed_subpath(
 /// [`kurbo::dash`] walks the element stream by arc length. A zero-length
 /// quad or cubic carries no direction and its arc-length inverse is
 /// degenerate, which stalls the pattern phase: everything past such an
-/// element comes back as one uninterrupted dash. Filtering them out first is
-/// free — the band expansion skips them anyway — and keeps the dash lengths
-/// and the phase exactly as they would be on the cleaned path.
+/// element comes back as one uninterrupted dash. Filtering them out first
+/// is free, since the band expansion skips them anyway, and it keeps the
+/// dash lengths and phase exactly as they would be on the cleaned path.
 fn non_degenerate(els: &[PathEl]) -> impl Iterator<Item = PathEl> + '_ {
     use kurbo::{CubicBez, Line, PathSeg, QuadBez};
     let mut cur: Option<Point> = None;
@@ -229,8 +234,9 @@ fn non_degenerate(els: &[PathEl]) -> impl Iterator<Item = PathEl> + '_ {
     })
 }
 
-/// Total straight-line length of a dash group's elements (cheap lower bound
-/// on its arc length; only used to identify fp-fattened zero dashes).
+/// Total straight-line length of a dash group's elements. A cheap lower
+/// bound on its arc length, used only to identify zero dashes that
+/// floating-point noise has fattened.
 fn group_chord_len(group: &[PathEl]) -> f64 {
     let mut len = 0.0;
     let mut last: Option<Point> = None;
@@ -248,10 +254,10 @@ fn group_chord_len(group: &[PathEl]) -> f64 {
 /// Emit dots for zero-length dashes.
 ///
 /// kurbo's dash stream represents a zero-length dash as a degenerate
-/// `MoveTo p, LineTo p` pair, which carries no tangent and which the band
-/// expansion (rightly) skips. Positions are recomputed here by pattern
-/// arithmetic and located on the source segments, which also yields the
-/// tangent needed to orient the band midpoint and square dots.
+/// `MoveTo p, LineTo p` pair. It carries no tangent, and the band expansion
+/// rightly skips it. Positions are recomputed here by pattern arithmetic
+/// and then located on the source segments, which also yields the tangent
+/// needed to offset the band midpoint and orient square dots.
 fn synthesize_dots(
     subpath: &[PathEl],
     closed: bool,

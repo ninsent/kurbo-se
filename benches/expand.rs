@@ -1,7 +1,7 @@
 // Copyright 2026 the kurbo-se Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Representative-path expansion benchmarks (`DoD` #8).
+//! Expansion benchmarks over representative paths.
 
 #![allow(missing_docs)] // criterion macros generate undocumented items
 

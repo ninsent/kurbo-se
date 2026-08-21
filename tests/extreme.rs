@@ -1,16 +1,17 @@
 // Copyright 2026 the kurbo-se Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Regression tests for the extreme-weight and self-intersection bug
-//! reports (sandbox session, 2026-08-20):
-//! 1. extreme weights saturate — the band fills the shape rather than
-//!    folding over itself — and never cross the fill boundary,
-//! 2. self-overlapping open paths must not punch unpainted pockets,
-//! 3. self-intersecting closed shapes resolve inside/outside per lobe
-//!    against the fill, like Figma.
+//! Regression tests for the extreme-weight and self-intersection reports
+//! from the 2026-08-20 sandbox session:
 //!
-//! The set-theoretic contract itself lives in `set_semantics.rs`; these are
-//! the concrete shapes and widths from the bug reports.
+//! 1. extreme weights saturate, so the band fills the shape rather than
+//!    folding over itself, and never cross the fill boundary;
+//! 2. self-overlapping open paths do not punch unpainted pockets;
+//! 3. self-intersecting closed shapes resolve inside/outside per lobe
+//!    against the fill, as Figma does.
+//!
+//! The set-theoretic contract itself lives in `set_semantics.rs`. These are
+//! the concrete shapes and widths from the reports.
 
 use kurbo::{BezPath, Circle, Point, Rect, Shape};
 use kurbo_se::{StrokeAlignment, StrokeStyle, stroke_aligned};

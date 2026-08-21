@@ -12,7 +12,11 @@
 //! Comparison is per-coordinate with a `1e-9` absolute tolerance rather than
 //! byte-exact: transcendental functions (`sin`, `atan2`, …) differ in the
 //! last bits across platform libms, which is noise; genuine behavior drift
-//! is either exactly zero or far larger.
+//! is either exactly zero or far larger. That slack cannot absorb discrete
+//! decisions, though — a last-bit difference can flip a subdivision choice
+//! in the offsetter and change the segment count. The fixture therefore
+//! records the OS it was generated on and the test skips on any other
+//! (the CI matrix still runs it on a matching runner).
 //!
 //! The fixture lives in the repository but is excluded from the crates.io
 //! package (it is a refactoring net, not a shipped artifact); when it is
@@ -179,6 +183,7 @@ fn fixture_path() -> PathBuf {
 /// Render the whole matrix to the fixture text format.
 fn generate() -> String {
     let mut out = String::new();
+    writeln!(out, "# platform: {}", std::env::consts::OS).unwrap();
     // Display tolerance keeps the fixture compact; two representative cases
     // run finer below to cover tolerance-dependent code paths.
     let tol = 0.25;
@@ -202,6 +207,9 @@ fn parse_fixture(text: &str) -> Vec<(String, String)> {
     let mut cases = Vec::new();
     let mut name: Option<String> = None;
     for line in text.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
         if let Some(n) = line.strip_prefix("== ") {
             name = Some(n.to_string());
         } else if let Some(n) = name.take() {
@@ -209,6 +217,13 @@ fn parse_fixture(text: &str) -> Vec<(String, String)> {
         }
     }
     cases
+}
+
+/// The `# platform:` header of a fixture, if present.
+fn fixture_platform(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|l| l.strip_prefix("# platform: "))
+        .map(str::trim)
 }
 
 /// Element-kind discriminant for sequence comparison.
@@ -280,6 +295,18 @@ fn golden_matrix_unchanged() {
         eprintln!("golden: fixture missing, skipping (repo-only test)");
         return;
     };
+
+    if let Some(p) = fixture_platform(&fixture) {
+        if p != std::env::consts::OS {
+            // A different libm can flip subdivision decisions (see the
+            // module docs); exactness only holds on the generating OS.
+            eprintln!(
+                "golden: fixture generated on {p}, running on {}; skipping",
+                std::env::consts::OS
+            );
+            return;
+        }
+    }
 
     let expected = parse_fixture(&fixture);
     let actual = parse_fixture(&generated);

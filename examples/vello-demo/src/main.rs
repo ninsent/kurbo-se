@@ -1,13 +1,13 @@
 //! End-to-end proof: kurbo-se outlines filled by vello with the nonzero rule,
-//! headless, with an animated `dash_offset` and per-frame timing (DoD #8).
+//! headless, with an animated `dash_offset` and per-frame timing.
 //!
 //! Renders 120 frames of a scene with inside/center/outside strokes plus an
 //! animated dashed ring, re-expanding every frame with a reused
 //! [`AlignedStrokeCtx`], then writes the last frame to `vello-demo.png`.
 //!
-//! Type identity is the point: vello re-exports the same `kurbo` that
-//! kurbo-se builds on, so the produced `BezPath` feeds `Scene::fill` with no
-//! conversion.
+//! Type identity is the point. vello re-exports the same `kurbo` that
+//! kurbo-se builds on, so the `BezPath` it produces feeds `Scene::fill`
+//! with no conversion.
 
 use std::time::Instant;
 

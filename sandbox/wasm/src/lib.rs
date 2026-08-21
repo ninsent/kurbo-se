@@ -1,5 +1,6 @@
-//! WASM surface for the kurbo-se sandbox: SVG path data in, SVG path data +
-//! debug JSON out. Deliberately renderer-free (plain SVG on the frontend).
+//! Wasm surface for the kurbo-se sandbox: SVG path data in, SVG path data
+//! and debug JSON out. Renderer-free on purpose; the frontend draws plain
+//! SVG.
 
 use kurbo_se::kurbo::{
     self, BezPath, Cap, Circle, Join, ParamCurve, PathEl, PathSeg, Rect, Shape, Vec2,
@@ -124,9 +125,9 @@ struct SubpathDto {
 struct JoinDto {
     x: f64,
     y: f64,
-    /// Interior corner angle, degrees.
+    /// Interior corner angle in degrees.
     angle: f64,
-    /// Whether a miter join falls back to bevel here.
+    /// Whether a miter join falls back to bevel at this corner.
     fell_back: bool,
 }
 
@@ -136,7 +137,7 @@ fn parse_inputs(path_d: &str, style_json: &str) -> Result<(BezPath, StrokeStyle)
     Ok((path, to_style(&dto)))
 }
 
-/// Expand a stroke; returns SVG path data (empty string on error).
+/// Expand a stroke and return SVG path data. Empty string on error.
 #[wasm_bindgen]
 pub fn expand_stroke(path_d: &str, style_json: &str, tolerance: f64) -> String {
     match parse_inputs(path_d, style_json) {
@@ -145,7 +146,7 @@ pub fn expand_stroke(path_d: &str, style_json: &str, tolerance: f64) -> String {
     }
 }
 
-/// Expand a stroke with debug info; returns a JSON object (see `DebugOut`).
+/// Expand a stroke with debug info, as a JSON object. See `DebugOut`.
 #[wasm_bindgen]
 pub fn expand_stroke_debug(path_d: &str, style_json: &str, tolerance: f64) -> String {
     let (path, style) = match parse_inputs(path_d, style_json) {
@@ -192,11 +193,12 @@ pub fn expand_stroke_debug(path_d: &str, style_json: &str, tolerance: f64) -> St
     serde_json::to_string(&debug).unwrap()
 }
 
-/// Corner markers: interior angle at each vertex of the source path, and
-/// whether a miter join would fall back to bevel there (angle ≤ threshold).
+/// Corner markers: the interior angle at each vertex of the source path,
+/// and whether a miter join falls back to bevel there, which happens when
+/// the angle is at or below the threshold.
 fn corner_joins(path: &BezPath, miter_angle: f64) -> Vec<JoinDto> {
     fn seg_tangents(seg: &PathSeg) -> (Vec2, Vec2) {
-        // Chord-based fallbacks, same spirit as kurbo's robust tangents.
+        // Chord-based fallbacks, in the spirit of kurbo's robust tangents.
         const EPS: f64 = 1e-12;
         match seg {
             PathSeg::Line(l) => (l.p1 - l.p0, l.p1 - l.p0),
@@ -243,8 +245,8 @@ fn corner_joins(path: &BezPath, miter_angle: f64) -> Vec<JoinDto> {
         }
         let sub = &els[i..j];
         let mut segs: Vec<PathSeg> = kurbo::segments(sub.iter().copied()).collect();
-        // Zero-length segments carry no direction; drop them so corners
-        // across them are still detected.
+        // Zero-length segments carry no direction. Drop them so a corner
+        // across one is still detected.
         segs.retain(|s| {
             let (t0, t1) = seg_tangents(s);
             t0.hypot2() > 1e-24 || t1.hypot2() > 1e-24
@@ -294,7 +296,7 @@ fn entry(name: &str, path: BezPath) -> GalleryEntry {
     }
 }
 
-/// The gallery, built from kurbo primitives (guaranteed-valid data).
+/// The gallery, built from kurbo primitives so the data is always valid.
 #[wasm_bindgen]
 pub fn gallery() -> String {
     let mut items = Vec::new();

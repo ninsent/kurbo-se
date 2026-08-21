@@ -36,9 +36,9 @@ const state = {
   startCap: "none" as "none" | "round" | "square",
   endCap: "none" as "none" | "round" | "square",
   dashed: false,
-  // Figma-style pattern: even indices are dash lengths, odd indices gaps;
-  // an odd-length list reads as doubled (2,7,4 -> 2,7,4,2,7,4), same as
-  // SVG stroke-dasharray and the crate.
+  // Figma-style pattern. Even indices are dash lengths, odd indices gaps,
+  // and an odd-length list reads as doubled: 2,7,4 -> 2,7,4,2,7,4. Same as
+  // SVG stroke-dasharray, and the same as the crate.
   dashPattern: [18, 10] as number[],
   dashOffset: 0,
   dashCap: "none" as "none" | "round" | "square",
@@ -128,11 +128,11 @@ function parseD(d: string): Parsed {
   return { anchors, controls, firstDir };
 }
 
-/// The `d` restricted to closed subpaths. SVG fills open subpaths as if
-/// implicitly closed, which would paint phantom areas under open polylines —
-/// the crate's fill semantics give open subpaths no fill at all. kurbo's
-/// `to_svg` emits absolute commands, so subpaths start at each `M` and a
-/// closed one contains a `Z`.
+/// The `d` restricted to closed subpaths. SVG fills an open subpath as if
+/// it were closed, which would paint phantom areas under open polylines;
+/// the crate gives open subpaths no fill at all. kurbo's `to_svg` emits
+/// absolute commands, so subpaths start at each `M`, and a closed one
+/// contains a `Z`.
 function closedSubpathsD(d: string): string {
   return d
     .split(/(?=M)/)
@@ -270,9 +270,9 @@ function checkbox(get: () => boolean, set: (v: boolean) => void): HTMLElement {
   return c;
 }
 
-/// "2, 4, 6, 8" -> [2, 4, 6, 8]: comma/space separated, non-negative finite
-/// entries only. An empty result means "no usable pattern" (renders solid,
-/// the crate's documented fallback for unusable patterns).
+/// "2, 4, 6, 8" -> [2, 4, 6, 8]. Comma or space separated, keeping only
+/// finite non-negative entries. An empty result means no usable pattern,
+/// which renders solid — the crate's documented fallback.
 function parseDashPattern(text: string): number[] {
   return text
     .split(/[,\s]+/)
@@ -281,8 +281,9 @@ function parseDashPattern(text: string): number[] {
     .filter((v) => Number.isFinite(v) && v >= 0);
 }
 
-/// Figma-style dash pattern input. Re-renders as you type; normalizes the
-/// text on blur (so half-typed junk doesn't get rewritten under the cursor).
+/// Figma-style dash pattern input. Re-renders as you type, and normalizes
+/// the text on blur, so half-typed input is never rewritten under the
+/// cursor.
 function dashPatternInput(): HTMLElement {
   const n = h("input", { type: "text", class: "pattern" });
   n.placeholder = "e.g. 2, 4, 6, 8";
@@ -463,8 +464,8 @@ function render() {
       "stroke-miterlimit": debug.miterLimit,
     };
     if (state.dashed && state.dashPattern.length > 0) {
-      // SVG stroke-dasharray shares the semantics exactly (even entries are
-      // dashes, odd-length lists double), so the oracle stays valid.
+      // SVG stroke-dasharray shares these semantics exactly — even entries
+      // are dashes, odd-length lists double — so the oracle stays valid.
       attrs["stroke-dasharray"] = state.dashPattern.join(" ");
       attrs["stroke-dashoffset"] = -state.dashOffset;
     }
@@ -643,18 +644,18 @@ function setupViewControls() {
   const canvas = document.getElementById("canvas")!;
   const viewport = document.getElementById("viewport")!;
 
-  // All wheel/pinch handling is captured at the window and gated by cursor
-  // COORDINATES, never by event target: Safari hit-tests SVG children and
-  // the SVG root differently, so target-based listeners work over the shape
-  // but not the empty canvas (or the other way round).
+  // All wheel and pinch handling is captured at the window and gated by
+  // cursor coordinates, never by event target. Safari hit-tests SVG
+  // children and the SVG root differently, so target-based listeners work
+  // over the shape but not the empty canvas, or the other way round.
   const overViewport = (x: number, y: number) => {
     const r = viewport.getBoundingClientRect();
     return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
   };
 
-  // ---- pinch (Safari WebKit-only gesture events) ----
-  // Fields are not in the TS DOM lib and not guaranteed at runtime; guard
-  // every number — a single NaN in the view blanks the whole canvas.
+  // ---- pinch, via Safari's WebKit-only gesture events ----
+  // These fields are not in the TS DOM lib and not guaranteed at runtime,
+  // so guard every number: one NaN in the view blanks the whole canvas.
   let pinch: { view: typeof state.view; fx: number; fy: number } | null = null;
   const gesturePoint = (e: Event) => {
     const rect = canvas.getBoundingClientRect();
@@ -714,10 +715,10 @@ function setupViewControls() {
   });
 
   // ---- wheel ----
-  // Figma-style: two-finger scroll pans; pinch (or ctrl/⌘ + scroll) zooms
-  // toward the cursor. Chrome/Firefox deliver trackpad pinches as ctrl+wheel
-  // with small deltas; a real mouse wheel notch is ±100+, so clamp the
-  // per-event factor to keep both usable.
+  // Figma-style: two-finger scroll pans, and pinch — or ctrl/⌘ + scroll —
+  // zooms toward the cursor. Chrome and Firefox deliver trackpad pinches as
+  // ctrl+wheel with small deltas, while a real mouse wheel notch is ±100 or
+  // more, so clamp the per-event factor to keep both usable.
   window.addEventListener(
     "wheel",
     (e) => {
@@ -801,7 +802,7 @@ function applyQueryParams() {
   str("startCap", ["none", "round", "square"], (v) => (state.startCap = v));
   str("endCap", ["none", "round", "square"], (v) => (state.endCap = v));
   flag("dashed", (v) => (state.dashed = v));
-  // `dashes=2,4,6,8`; the legacy `dash`/`gap` pair still works so old
+  // `dashes=2,4,6,8`. The legacy `dash`/`gap` pair still works, so old
   // shared URLs keep rendering the same thing.
   const dashes = q.get("dashes");
   if (dashes !== null) {

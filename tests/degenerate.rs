@@ -1,7 +1,7 @@
 // Copyright 2026 the kurbo-se Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! The degenerate-input matrix: no panics, no NaN in output,
+//! The degenerate-input matrix: no panics, no NaN in the output, and
 //! deterministic behavior. Every case runs at all alignments and joins.
 
 use kurbo::{BezPath, Cap, Join, PathEl, Shape};

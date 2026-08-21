@@ -3,36 +3,36 @@
 
 //! Distance-pruned offset regions for one-sided bands on closed contours.
 //!
-//! The band of a closed contour is defined *set-theoretically*, matching
-//! Figma (whose inside/outside strokes are a doubled centered stroke masked
-//! by the fill):
+//! The band of a closed contour is defined set-theoretically, matching
+//! Figma, whose inside and outside strokes are a doubled centered stroke
+//! masked by the fill:
 //!
 //! ```text
 //! Inside(w)  = { p ∈ F : dist(p, path) ≤ w } = F \ E
 //! Outside(w) = { p ∉ F : dist(p, path) ≤ w } = D \ F
 //! ```
 //!
-//! with `F` the filled region of the whole path (nonzero), `E` its erosion by
-//! `w` and `D` its dilation. So the outline is the source contours plus the
-//! boundary of the eroded (or dilated) region, wound the other way — and the
-//! whole problem reduces to computing `∂E` / `∂D`.
+//! `F` is the filled region of the whole path under nonzero winding, `E` is
+//! its erosion by `w`, and `D` is its dilation. The outline is then the
+//! source contours plus the boundary of the eroded or dilated region, wound
+//! the other way, so the whole problem reduces to computing `∂E` and `∂D`.
 //!
-//! Those are *not* the naive offset curves: past the local thickness the
-//! offset self-intersects and inverts. They are computed the classical way —
-//! raw offsets for every contour, cut at every intersection (with themselves
-//! **and with each other**), then discard each piece that is nearer than `w`
-//! to the path, on the wrong side of the fill, or inside another loop's
-//! region (a winding test against the raw loops themselves — required for
-//! miter/bevel joins, whose loops deviate from the distance-`w` set at
-//! corners), and stitch what survives. Cutting across contours matters: it
-//! is what makes overlapping bands merge into one boundary instead of two
-//! overlapping ones, which nonzero winding could not express.
+//! Those are not the naive offset curves: past the local thickness the
+//! offset self-intersects and inverts. They are computed the classical way.
+//! Take the raw offset of every contour, cut it at every intersection with
+//! itself and with the others, then discard each piece that is nearer than
+//! `w` to the path, on the wrong side of the fill, or inside another loop's
+//! region, and stitch what survives. That last test is a winding test
+//! against the raw loops themselves, which miter and bevel joins require —
+//! their loops deviate from the distance-`w` set at corners. Cutting across
+//! contours is what makes overlapping bands merge into one boundary instead
+//! of two overlapping ones, which nonzero winding could not express.
 //!
-//! When nothing survives, the erosion is empty and the stroke **saturates**:
-//! the shape is filled completely (a wedge, a thin star, a rectangle narrower
-//! than `2w`) — exactly as Figma renders it. Dropped pieces whose neighbours
-//! survive are rejoined with a straight line, which reproduces bevel-join
-//! chords exactly.
+//! When nothing survives, the erosion is empty and the stroke saturates:
+//! the shape fills completely, as Figma renders a wedge, a thin star, or a
+//! rectangle narrower than `2w`. Dropped pieces whose neighbours survive
+//! are rejoined with a straight line, which reproduces bevel-join chords
+//! exactly.
 
 use alloc::vec::Vec;
 
@@ -61,14 +61,13 @@ pub(crate) struct ContourSpec<'a> {
     pub fill_side: StrokeSide,
 }
 
-/// Y-bucketed flattened edges: the machinery shared by [`SourceIndex`] and
-/// [`RawIndex`].
+/// Y-bucketed flattened edges, shared by [`SourceIndex`] and [`RawIndex`].
 ///
-/// An edge is `(a, b, tag, real)` — the flattened segment, the ordinal of
-/// the contour (or raw loop) it belongs to, and whether it is part of the
-/// path for distance purposes (`real == false` marks an implicit closing
-/// chord, which counts for winding only). The predicates take a per-edge
-/// filter so each wrapper can scope a query to, or away from, one tag.
+/// An edge is `(a, b, tag, real)`: the flattened segment, the ordinal of
+/// the contour or raw loop it belongs to, and whether it is part of the
+/// path for distance purposes. `real == false` marks an implicit closing
+/// chord, which counts for winding only. The predicates take a per-edge
+/// filter, so each wrapper can scope a query to one tag or away from it.
 struct EdgeIndex {
     edges: Vec<(Point, Point, u32, bool)>,
     buckets: Vec<Vec<u32>>,
@@ -117,10 +116,10 @@ impl EdgeIndex {
 
     /// Nonzero winding at `p` of the edges whose tag passes `keep`.
     ///
-    /// Exactly one bucket is scanned: an edge crossing `y = p.y` always
+    /// Exactly one bucket is scanned. An edge crossing `y = p.y` always
     /// spans that bucket, and visiting a neighbour would double-count edges
-    /// registered in both — which breaks the cancellation that makes the
-    /// winding zero outside the shape.
+    /// registered in both, breaking the cancellation that makes the winding
+    /// zero outside the shape.
     fn winding_where(&self, p: Point, keep: impl Fn(u32) -> bool) -> i32 {
         let mut w = 0;
         for &ix in &self.buckets[self.bucket_ix(p.y)] {
@@ -141,8 +140,8 @@ impl EdgeIndex {
 
     /// Whether any edge passing `keep` lies within `sqrt(r_sq)` of `p`.
     ///
-    /// Phrased as an early-exit scan: an edge whose box is already beyond
-    /// the radius cannot qualify, and the first hit ends it. Callers
+    /// An early-exit scan: an edge whose box is already beyond the radius
+    /// cannot qualify, and the first hit ends the scan. Callers
     /// special-case non-positive `r_sq`.
     fn within_where(&self, p: Point, r_sq: f64, keep: impl Fn(u32, bool) -> bool) -> bool {
         let n = self.buckets.len();
@@ -178,18 +177,18 @@ impl EdgeIndex {
     }
 }
 
-/// Source geometry prepared for the two hot predicates: "is this point inside
-/// the region?" and "is it far enough from the path?".
+/// Source geometry prepared for the two hot predicates: is this point
+/// inside the region, and is it far enough from the path.
 ///
-/// Both would otherwise be a per-curve solve — [`kurbo::Shape::winding`],
-/// [`kurbo::ParamCurveNearest::nearest`] — evaluated once per candidate
+/// Both would otherwise be a per-curve solve — [`kurbo::Shape::winding`]
+/// and [`kurbo::ParamCurveNearest::nearest`] — run once per candidate
 /// piece, which dominates the pipeline. The path is flattened once instead
-/// and its edges bucketed by `y`, so a query touches only the edges that can
-/// matter. Flattening error is folded into the distance threshold.
+/// and its edges bucketed by `y`, so a query touches only the edges that
+/// can matter. Flattening error is folded into the distance threshold.
 ///
-/// Edge tags are subpath ordinals, so the distance test can be restricted to
-/// a piece's own contour (cross-contour validity is a winding question, not
-/// a distance one — see `region_loops`).
+/// Edge tags are subpath ordinals, so the distance test can be restricted
+/// to a piece's own contour. Cross-contour validity is a winding question,
+/// not a distance one; see `region_loops`.
 pub(crate) struct SourceIndex {
     index: EdgeIndex,
     flat_tol: f64,
@@ -278,11 +277,11 @@ impl SourceIndex {
 /// Flattened raw offset loops with per-edge owner tags.
 ///
 /// Backs the cross-contour membership test: a piece of loop `i` belongs to
-/// the region boundary only where the *other* loops' winding matches the
-/// expected value. Distance to the source path cannot express this for
-/// miter/bevel joins, whose loops deviate from the distance-`w` set at
-/// corners (a miter wedge reaches past `w`, and an arc of another contour
-/// hiding inside that wedge must still be pruned).
+/// the region boundary only where the other loops' winding matches the
+/// expected value. Distance to the source path cannot express that for
+/// miter and bevel joins, whose loops deviate from the distance-`w` set at
+/// corners. A miter wedge reaches past `w`, and an arc of another contour
+/// hiding inside that wedge still has to be pruned.
 struct RawIndex {
     index: EdgeIndex,
 }
@@ -335,10 +334,10 @@ impl RawIndex {
 
     /// Whether `p` lies within `sqrt(r_sq)` of any loop except `owner`'s.
     ///
-    /// A piece that close to another loop cannot be classified by winding —
-    /// the loops locally coincide (a donut at exactly half its ring
-    /// thickness) — and is pruned instead, collapsing sub-resolution
-    /// regions to clean saturation.
+    /// A piece that close to another loop cannot be classified by winding,
+    /// because the loops locally coincide — a donut at exactly half its
+    /// ring thickness does this. Pruning it collapses sub-resolution
+    /// regions into clean saturation.
     fn is_near_other(&self, p: Point, r_sq: f64, owner: usize) -> bool {
         if r_sq <= 0.0 {
             return false;
@@ -365,16 +364,16 @@ pub(crate) fn region_loops(
     scratch: &mut BezPath,
     sink: &mut BezPath,
 ) -> Vec<BezPath> {
-    // Resolution of the pruning predicate: offset approximation, tolerance
-    // and flattening error stack up to about this length. Features smaller
+    // Resolution of the pruning predicate. Offset approximation, tolerance
+    // and flattening error stack up to about this length; features smaller
     // than it fall inside the documented boundary band.
     let fuzz = PRUNE_SLACK * width + 2.0 * base.tolerance + index.slack();
 
     // --- raw offsets, one per contour ---
     let mut raws: Vec<BezPath> = Vec::with_capacity(contours.len());
     // Per-raw, per-segment relaxation of the distance prune: `1` for plain
-    // offset geometry, `cos(φ/2)` where a bevel chord legitimately cuts its
-    // corner (see `keep_at`).
+    // offset geometry, `cos(φ/2)` where a bevel chord legitimately cuts
+    // its corner. See `keep_at`.
     let mut raws_relax: Vec<Vec<f64>> = Vec::with_capacity(contours.len());
     for c in contours {
         let side = match kind {
@@ -411,12 +410,13 @@ pub(crate) fn region_loops(
         }
         let mut closed = raw.clone();
         closed.close_path();
-        // Collapsed offset (width at the local thickness): the loop
-        // degenerates to a tolerance-scale cluster, which `offset_cubic`'s
-        // cusp handling can shatter into thousands of segments — and the
-        // pairwise cut of that cluster is quadratic in them. A loop smaller
-        // than the pruning fuzz cannot bound a resolvable region feature;
-        // drop it before it reaches the cutter.
+        // Collapsed offset, where the width reaches the local thickness:
+        // the loop degenerates to a tolerance-scale cluster, which
+        // `offset_cubic`'s cusp handling can shatter into thousands of
+        // segments, and the pairwise cut of that cluster is quadratic in
+        // them. A loop smaller than the pruning fuzz cannot bound a
+        // resolvable region feature, so drop it before it reaches the
+        // cutter.
         if closed.control_box().size().max_side() <= fuzz {
             raws.push(BezPath::new());
             raws_relax.push(Vec::new());
@@ -442,37 +442,38 @@ pub(crate) fn region_loops(
 
     let thresh = (width * (1.0 - PRUNE_SLACK) - 2.0 * base.tolerance - index.slack()).max(0.0);
     let want_filled = kind == RegionKind::Erosion;
-    // Cross-contour membership needs the *other* raw loops' winding: with
-    // miter/bevel joins a loop deviates from the distance-`w` set at
+    // Cross-contour membership needs the other raw loops' winding. With
+    // miter and bevel joins a loop deviates from the distance-`w` set at
     // corners, so distance alone cannot tell whether a piece hides inside
-    // another contour's region. Expected winding follows the owning loop's
-    // orientation: 0 for outer-like (CW) loops, +1 for hole-like (CCW)
-    // loops, whose enclosing outer loop contributes one turn. Only needed
-    // when two or more loops are live.
-    // Loop orientation, taken from the *source* contour (the loop inherits
-    // its travel direction; the raw loop's own net area is unreliable when
-    // the offset self-intersects, e.g. the overshoot star of a sharp
-    // triangle's inward offset).
+    // another contour's region. The expected winding follows the owning
+    // loop's orientation: 0 for outer-like (CW) loops, +1 for hole-like
+    // (CCW) loops, whose enclosing outer loop contributes one turn. This is
+    // only needed when two or more loops are live.
+    //
+    // Orientation comes from the source contour, whose travel direction the
+    // loop inherits. The raw loop's own net area is unreliable when the
+    // offset self-intersects, as in the overshoot star of a sharp
+    // triangle's inward offset.
     let cw: Vec<bool> = contours.iter().map(|c| c.els.area() >= 0.0).collect();
     let live = raws.iter().filter(|r| r.elements().len() >= 2).count();
     let raw_index = (live >= 2).then(|| RawIndex::new(&raws, index.slack()));
     // The join relaxation applies to the dilation only. There, cutting a
-    // corner is the style the caller asked for and the strict test tears the
-    // union apart; the dilation never folds inward, so nothing needs the
-    // slack as a guard. For the erosion the distance test *is* the
+    // corner is the style the caller asked for, and the strict test tears
+    // the union apart; the dilation never folds inward, so nothing needs
+    // the slack as a guard. For the erosion the distance test is the
     // saturation guard — a spurious survivor becomes a hole in a shape that
-    // should be solid — and dropping a bevel chord costs nothing, because
-    // `stitch` bridges the gap with the very same chord.
+    // should be solid — and dropping a bevel chord costs nothing there,
+    // because `stitch` bridges the gap with the same chord.
     let relax_joins = kind == RegionKind::Dilation;
     let keep_at = |p: Point, owner: usize, relax: f64| {
-        // Self-validity: far enough from the piece's *own* contour (prunes
-        // fold-over past the local thickness). Only the own contour —
-        // proximity to another contour says nothing under miter/bevel
+        // Self-validity: far enough from the piece's own contour, which
+        // prunes fold-over past the local thickness. Only the own contour.
+        // Proximity to another contour says nothing under miter and bevel
         // joins, whose loops deviate from the distance-`w` set at corners;
         // cross-contour validity is the winding test below. A bevel chord
         // legitimately cuts its corner, so its own threshold is scaled by
-        // `cos(φ/2)` — bounded, unlike a blanket exemption, which at
-        // extreme widths let huge join fans survive inside the shape.
+        // `cos(φ/2)`. That bound matters: a blanket exemption let huge join
+        // fans survive inside the shape at extreme widths.
         let thr = if relax_joins { thresh * relax } else { thresh };
         if !index.is_clear_of(p, thr * thr, Some(owner)) {
             return false;
@@ -481,8 +482,8 @@ pub(crate) fn region_loops(
         if (index.winding(p) != 0) != want_filled {
             return false;
         }
-        // Not swallowed by (or escaped from) the other loops' region, and
-        // not so close to another loop that the winding answer is fuzz.
+        // Not swallowed by the other loops' region, not escaped from it,
+        // and not so close to another loop that the winding answer is fuzz.
         match &raw_index {
             None => true,
             Some(ri) => {
@@ -494,12 +495,12 @@ pub(crate) fn region_loops(
     };
 
     // --- fast path: nothing cuts ---
-    // Validity flips only across an intersection (segment joints are piece
-    // boundaries already), so with no interior cuts every loop is uniformly
-    // valid or invalid: classify each by a few midpoint samples and skip
-    // subdivision, per-piece pruning and stitching. Disagreeing samples are
-    // possible only within the boundary band; fall back to the full
-    // pipeline for those.
+    // Validity flips only across an intersection, since segment joints are
+    // already piece boundaries. With no interior cuts every loop is
+    // uniformly valid or invalid, so classify each by a few midpoint
+    // samples and skip subdivision, per-piece pruning, and stitching.
+    // Samples can only disagree within the boundary band; fall back to the
+    // full pipeline when they do.
     if !cut.any_interior {
         let mut keep = alloc::vec![false; raws.len()];
         let mut mixed = false;
@@ -547,14 +548,14 @@ pub(crate) fn region_loops(
     drop_unresolvable(stitch(&kept, accuracy), fuzz)
 }
 
-/// Empty out a region that is thinner than the pipeline's resolution.
+/// Empty out a region thinner than the pipeline's resolution.
 ///
 /// The loops describe the region by nonzero winding with consistent
-/// orientations, so the net signed area *is* the region's area, and
+/// orientations, so the net signed area is the region's area, and
 /// `net / perimeter` bounds its mean thickness. A region thinner than the
-/// fuzz everywhere sits inside the documented boundary band — most
-/// importantly the cancel pair stitched from two nearly coincident offsets
-/// (a donut at exactly half its ring thickness), which otherwise ships
+/// fuzz everywhere sits inside the documented boundary band. The case that
+/// matters is the cancel pair stitched from two nearly coincident offsets —
+/// a donut at exactly half its ring thickness — which otherwise ships
 /// hundreds of fuzz segments that paint nothing.
 fn drop_unresolvable(loops: Vec<BezPath>, fuzz: f64) -> Vec<BezPath> {
     let net: f64 = loops.iter().map(|l| l.elements().area()).sum();
@@ -579,9 +580,9 @@ struct CutSegs {
     /// Distance-prune relaxation per segment (see `region_loops`).
     relax: Vec<f64>,
     cuts: Vec<Vec<f64>>,
-    /// Whether any cut lands in a segment's interior. Endpoint touches are
-    /// dropped by `subdivide_at` anyway, so without interior cuts the
-    /// subdivision is a no-op and the fast path applies.
+    /// Whether any cut lands in a segment's interior. `subdivide_at` drops
+    /// endpoint touches anyway, so without interior cuts the subdivision is
+    /// a no-op and the fast path applies.
     any_interior: bool,
 }
 
@@ -656,11 +657,11 @@ impl CutSegs {
     }
 }
 
-/// Whether a closed loop bounds meaningful area: its |signed area| must
-/// exceed a perimeter-proportional sliver threshold. This catches both tiny
-/// loops (the erosion collapsing at the saturation width) and long
-/// near-degenerate rings (the fuzz stitched from two nearly coincident
-/// offsets, e.g. a donut whose inward offsets meet in the middle).
+/// Whether a closed loop bounds meaningful area: its absolute signed area
+/// must exceed a perimeter-proportional sliver threshold. This catches both
+/// tiny loops, where the erosion collapses at the saturation width, and
+/// long near-degenerate rings, the fuzz stitched from two nearly coincident
+/// offsets when a donut's inward offsets meet in the middle.
 fn substantial_loop(path: &BezPath, accuracy: f64) -> bool {
     if path.elements().len() < 4 {
         return false;
@@ -674,12 +675,13 @@ fn substantial_loop(path: &BezPath, accuracy: f64) -> bool {
 
 /// Reassemble surviving pieces into closed loops.
 ///
-/// At an intersection the surviving strand continues from the *same point*,
-/// so the walk hands over to whichever unused piece starts there — including
-/// a piece belonging to another contour, which is how overlapping bands merge
-/// into a single boundary. Elsewhere (a dropped bevel chord, a trimmed spike)
-/// it falls through to the next survivor of the same contour and bridges with
-/// a line; for a bevel join that line is the chord itself.
+/// At an intersection the surviving strand continues from the same point,
+/// so the walk hands over to whichever unused piece starts there. That
+/// includes a piece belonging to another contour, which is how overlapping
+/// bands merge into a single boundary. Elsewhere — at a dropped bevel
+/// chord or a trimmed spike — it falls through to the next survivor of the
+/// same contour and bridges with a line. For a bevel join that line is the
+/// chord itself.
 fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64) -> Vec<BezPath> {
     let n = kept.len();
     let eps = (accuracy * 16.0).max(1e-9);

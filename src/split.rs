@@ -3,23 +3,23 @@
 
 //! Splitting subpaths at their self-intersections.
 //!
-//! A one-sided band flips which geometric side faces the fill whenever the
-//! path crosses itself: banding the raw subpath then produces windings that
-//! *cancel* (unpainted pockets), and inside/outside stop matching the filled
-//! region — Figma resolves both against the fill because its strokes are
-//! masked by it. kurbo-se gets the same behavior by cutting each subpath at
-//! its self-intersections into **lobes** (closed simple-ish loops) and
-//! **strands** (leftover open runs), resolving the side per lobe with the
-//! usual fill probe, and banding each piece independently — independent
-//! contours add winding instead of cancelling.
+//! A one-sided band flips which geometric side faces the fill wherever the
+//! path crosses itself. Banding the raw subpath then produces windings that
+//! cancel, leaving unpainted pockets, and inside/outside stop matching the
+//! filled region. Figma resolves both against the fill, because its strokes
+//! are masked by it. kurbo-se gets the same behavior by cutting each
+//! subpath at its self-intersections into lobes (closed, roughly simple
+//! loops) and strands (the leftover open runs), resolving the side per lobe
+//! with the usual fill probe, and banding each piece independently.
+//! Independent contours add winding instead of cancelling.
 //!
 //! Intersections are found by bounding-box subdivision to a parametric
-//! accuracy; single-segment loops (a cubic crossing itself) are handled by
-//! pre-splitting at the curve's extrema, since an axis-monotone piece cannot
-//! self-intersect. Interleaved (non-nested) crossing patterns — pretzels —
-//! decompose only partially; the result is still artifact-reduced and never
-//! panics. Tangential touches are deliberately ignored (they don't flip
-//! sides).
+//! accuracy. Single-segment loops, where a cubic crosses itself, are
+//! handled by pre-splitting at the curve's extrema, since an axis-monotone
+//! piece cannot self-intersect. Interleaved crossing patterns — pretzels,
+//! whose crossings do not nest — decompose only partially; the result still
+//! has fewer artifacts than the unsplit band and never panics. Tangential
+//! touches are ignored on purpose, since they do not flip sides.
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -30,9 +30,10 @@ use kurbo::{BezPath, ParamCurve, ParamCurveExtrema, PathEl, PathSeg, Point, Rect
 pub(crate) const T_EPS: f64 = 1e-6;
 
 /// Parametric margin trimmed off shared endpoints of adjacent segments
-/// before intersecting them. A smooth joint then rejects at the bounding-box
-/// level instead of recursing to flatness; cuts this close to a joint are
-/// redundant anyway (segment boundaries are already piece boundaries).
+/// before intersecting them. A smooth joint then rejects at the
+/// bounding-box level instead of recursing to flatness. Cuts this close to
+/// a joint are redundant anyway: segment boundaries are already piece
+/// boundaries.
 const ADJ_TRIM: f64 = 1e-3;
 /// Cluster radius for deduplicating hits, in parameter space.
 const DEDUP_EPS: f64 = 1e-4;
@@ -45,8 +46,9 @@ pub(crate) struct SplitPiece {
     pub closed: bool,
 }
 
-/// A dash unit: a contiguous run between crossings, with its arc-length
-/// start in the original subpath (for phase-continuous dashing).
+/// A dash unit: a contiguous run between crossings, carrying its
+/// arc-length start in the original subpath so dashing stays
+/// phase-continuous.
 pub(crate) struct SplitArc {
     pub els: BezPath,
     pub s0: f64,
@@ -56,8 +58,8 @@ pub(crate) struct SplitArc {
 pub(crate) struct SplitResult {
     pub pieces: Vec<SplitPiece>,
     pub arcs: Vec<SplitArc>,
-    /// The crossing vertices (both strands' cut points), for join
-    /// suppression at crossing tips.
+    /// The crossing vertices, meaning both strands' cut points. Used to
+    /// suppress joins at crossing tips.
     pub crossing_points: Vec<Point>,
 }
 
@@ -70,7 +72,7 @@ pub(crate) fn split_self_intersections(
     accuracy: f64,
 ) -> Option<SplitResult> {
     // Degenerate segments carry no geometry, but their endpoints coincide
-    // with their neighbours' — the duplicate-vertex pass below would read a
+    // with their neighbours'. The duplicate-vertex pass below would read a
     // run of them as the path revisiting a point and split there.
     let segs: Vec<PathSeg> = kurbo::segments(subpath.iter().copied())
         .filter(|s| !crate::math::is_degenerate(s))
@@ -88,8 +90,9 @@ pub(crate) fn split_self_intersections(
     }
     let mut cuts: Vec<Cut> = Vec::new();
     let mut n_crossings = 0usize;
-    // Precomputed boxes: rejecting a pair here avoids both the intersection
-    // search and its allocation, which dominates on many-segment paths.
+    // Precomputed boxes. Rejecting a pair here avoids both the
+    // intersection search and its allocation, which dominate on
+    // many-segment paths.
     let bboxes: Vec<kurbo::Rect> = segs.iter().map(ParamCurveExtrema::bounding_box).collect();
 
     let mut push_crossing = |cuts: &mut Vec<Cut>, a: (usize, f64), b: (usize, f64)| {
@@ -133,17 +136,18 @@ pub(crate) fn split_self_intersections(
         }
     }
 
-    // Crossings *at vertices*: the path re-visits an anchor point (the
-    // figure-eight crosses exactly at its center anchor). Detected by
+    // Crossings at vertices, where the path revisits an anchor point. A
+    // figure-eight crosses exactly at its center anchor. These are found as
     // duplicate end-of-segment positions; each duplicate pair is one
-    // crossing with cuts at the segment ends. A revisit of the start point
-    // of a closed subpath pairs with the seam (end of the last segment).
+    // crossing with cuts at the segment ends. A revisit of a closed
+    // subpath's start point pairs with the seam, the end of the last
+    // segment.
     const VTX_EPS2: f64 = 1e-12;
     let vertex_after: Vec<Point> = segs.iter().map(|s| s.end()).collect();
     for i in 0..n.saturating_sub(1) {
         for j in (i + 1)..n {
             if j == n - 1 && !closed {
-                // End of an open path touching an interior vertex is a
+                // The end of an open path touching an interior vertex is a
                 // T-touch, not a crossing.
                 continue;
             }
@@ -190,7 +194,7 @@ pub(crate) fn split_self_intersections(
                 s0: cur_s0,
                 end_crossing: Some(c.crossing),
             });
-            cur_s0 = s + seg_len * t; // arc-length approximation via parameter share
+            cur_s0 = s + seg_len * t; // arc length approximated by parameter share
             cur = BezPath::new();
             cur.move_to(seg.eval(t));
             t0 = t;
@@ -221,8 +225,9 @@ pub(crate) fn split_self_intersections(
         }
     }
 
-    // For closed subpaths the seam is not a cut: merge the trailing arc into
-    // the leading one (contiguous through the seam; phase continues past L).
+    // For a closed subpath the seam is not a cut, so merge the trailing arc
+    // into the leading one. They are contiguous through the seam, and the
+    // phase continues past the total length.
     if closed && arcs.len() >= 2 {
         if arcs.last().unwrap().els.elements().len() < 2 {
             // A cut landed exactly on the seam; the stub carries nothing.
@@ -252,8 +257,8 @@ pub(crate) fn split_self_intersections(
             if let Some(mark) = open[c].take() {
                 // Arcs since the mark form a closed lobe.
                 let lobe: Vec<usize> = chain.drain(mark..).collect();
-                // Crossings opened inside the popped run are gone with it
-                // (interleaved patterns decompose only partially).
+                // Crossings opened inside the popped run go with it, which
+                // is why interleaved patterns decompose only partially.
                 for o in open.iter_mut() {
                     if o.is_some_and(|m| m >= chain.len()) {
                         *o = None;
@@ -286,12 +291,12 @@ pub(crate) fn split_self_intersections(
             piece_of_arc[aix] = pix;
         }
         if els.elements().len() < 2 {
-            // Degenerate sliver (e.g. cuts closer than T_EPS): give up on
-            // splitting rather than emit broken pieces.
+            // A degenerate sliver, from cuts closer together than T_EPS.
+            // Give up on splitting rather than emit broken pieces.
             return None;
         }
-        // A piece is closed when its endpoints coincide: lobes always do;
-        // the leftover chain does iff the subpath was closed.
+        // A piece is closed when its endpoints coincide. Lobes always do.
+        // The leftover chain does exactly when the subpath was closed.
         let is_leftover = pix == pieces.len() - 1 && arcs.last().unwrap().end_crossing.is_none();
         let piece_closed = if is_leftover { closed } else { true };
         if piece_closed {
@@ -328,10 +333,10 @@ pub(crate) fn segment_self_intersection_params(seg: &PathSeg, accuracy: f64) -> 
 
 /// Intersection parameters of two segments.
 ///
-/// `next` marks `end(a) = start(b)` adjacency, `wrap` marks
-/// `start(a) = end(b)` (the seam pair of a closed contour); both can hold at
-/// once for a two-segment contour. The shared endpoints are trimmed off the
-/// search domain ([`ADJ_TRIM`]), so a smooth joint costs one bounding-box
+/// `next` marks `end(a) = start(b)` adjacency; `wrap` marks
+/// `start(a) = end(b)`, the seam pair of a closed contour. Both hold at
+/// once for a two-segment contour. Shared endpoints are trimmed off the
+/// search domain by [`ADJ_TRIM`], so a smooth joint costs one bounding-box
 /// rejection instead of a recursion to flatness, and the joint itself is
 /// never reported as a crossing.
 pub(crate) fn segment_pair_params(
@@ -361,8 +366,8 @@ pub(crate) fn segment_pair_params(
     hits
 }
 
-/// Subdivide a segment at the given parameters (sorted and deduplicated in
-/// place); interior cuts only.
+/// Subdivide a segment at the given parameters, which are sorted and
+/// deduplicated in place. Interior cuts only.
 pub(crate) fn subdivide_at(seg: &PathSeg, ts: &mut Vec<f64>) -> Vec<PathSeg> {
     ts.retain(|t| *t > T_EPS && *t < 1.0 - T_EPS);
     ts.sort_by(f64::total_cmp);
@@ -416,10 +421,10 @@ fn point_line_dist(p: Point, a: Point, b: Point) -> f64 {
     ((p - a).cross(d)).abs() / crate::math::sqrt(len2)
 }
 
-/// Self-intersections of one segment (cubic loops): split at the curve's
-/// extrema — monotone pieces cannot self-intersect — and intersect the
-/// pieces pairwise. Adjacent pieces get their shared endpoint trimmed off
-/// the domain (same rationale as [`segment_pair_params`]).
+/// Self-intersections of one segment, meaning cubic loops. Split at the
+/// curve's extrema, since monotone pieces cannot self-intersect, then
+/// intersect the pieces pairwise. Adjacent pieces get their shared endpoint
+/// trimmed off the domain, for the reason [`segment_pair_params`] gives.
 fn seg_self_intersections(seg: &PathSeg, accuracy: f64) -> Vec<(f64, f64)> {
     if !matches!(seg, PathSeg::Cubic(_)) {
         return Vec::new();
@@ -508,7 +513,7 @@ fn recurse(
         out.push((ta, tb));
         return;
     }
-    // Subdivide the less flat one (or both when comparable).
+    // Subdivide the less flat one, or both when they are comparable.
     if fa > accuracy && (fa >= fb || fb <= accuracy) {
         let am = 0.5 * (ar.0 + ar.1);
         let a_lo = a.subsegment(0.0..0.5);

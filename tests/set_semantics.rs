@@ -8,8 +8,9 @@
 //! Outside(w) = { p ∉ F : dist(p, path) ≤ w }
 //! ```
 //!
-//! Sampled on a grid, with a band of `±slack` around `dist = w` excluded
-//! (approximation error near the boundary is expected and harmless).
+//! Sampled on a grid, with a band of `±slack` around `dist = w` excluded.
+//! Approximation error that close to the boundary is expected and
+//! harmless.
 
 use kurbo::{BezPath, Circle, Join, ParamCurveNearest, Point, Rect, Shape};
 use kurbo_se::{StrokeAlignment, StrokeStyle, stroke_aligned};
@@ -23,12 +24,13 @@ fn dist_to_path(path: &BezPath, p: Point) -> f64 {
         .sqrt()
 }
 
-/// Check both alignments of `path` at width `w` against the set definition.
+/// Check both alignments of `path` at width `w` against the set
+/// definition.
 ///
-/// Round joins are used throughout: the set definition is the Minkowski sum
-/// with a disc, which is exactly what a round join produces. Miter and bevel
-/// joins deliberately deviate at convex corners (a miter spike reaches past
-/// `w`), so they are covered by the geometry tests instead.
+/// Round joins throughout: the set definition is the Minkowski sum with a
+/// disc, which is what a round join produces. Miter and bevel joins
+/// deliberately deviate at convex corners — a miter spike reaches past `w`
+/// — so the geometry tests cover those instead.
 fn check(name: &str, path: &BezPath, w: f64, grid: usize) {
     for alignment in [StrokeAlignment::Inside, StrokeAlignment::Outside] {
         let style = StrokeStyle::new(w)
@@ -72,13 +74,14 @@ fn check(name: &str, path: &BezPath, w: f64, grid: usize) {
 }
 
 /// Check a centered stroke against its set definition,
-/// `Center(w) = { p : dist(p, path) ≤ w/2 }`, independent of the fill.
+/// `Center(w) = { p : dist(p, path) ≤ w/2 }`, which is independent of the
+/// fill.
 ///
-/// Round joins for the same reason as [`check`]; holds at any width for
-/// closed simple contours — past the local thickness the band saturates
-/// instead of the inverted inner boundary punching holes (2026-08-21
-/// report: a circle stroked wider than its diameter grew a hole in the
-/// middle).
+/// Round joins for the reason [`check`] gives. This holds at any width for
+/// closed simple contours: past the local thickness the band saturates
+/// instead of the inverted inner boundary punching holes. The 2026-08-21
+/// report was a circle stroked wider than its diameter, which grew a hole
+/// in the middle.
 fn check_center(name: &str, path: &BezPath, w: f64, grid: usize) {
     let style = StrokeStyle::new(w)
         .with_alignment(StrokeAlignment::Center)

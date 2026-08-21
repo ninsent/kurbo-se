@@ -14,17 +14,17 @@ use crate::normalize;
 use crate::orient;
 use crate::style::{StrokeAlignment, StrokeSide, StrokeStyle};
 
-/// Reusable buffers for repeated stroke expansion (mirrors kurbo's
-/// [`StrokeCtx`](kurbo::StrokeCtx) pattern, which was made public exactly for
-/// this purpose).
+/// Reusable buffers for repeated stroke expansion. Mirrors kurbo's
+/// [`StrokeCtx`](kurbo::StrokeCtx) pattern, which was made public for
+/// exactly this purpose.
 ///
 /// Reusing one context across calls lets the large expansion buffers keep
-/// their capacity — the intended usage for animated `dash_offset`
-/// (re-expansion per frame is the supported model; see the crate docs for
-/// measured costs). The direct band path then runs allocation-free; the
-/// region construction and the dash fill mask still make small per-call
-/// allocations (piece lists, flattened indexes), already counted in the
-/// published timings.
+/// their capacity. That is the intended usage for an animated
+/// `dash_offset`: re-expansion per frame is the supported model, and the
+/// crate docs list measured costs. The direct band path then runs
+/// allocation-free. The region construction and the dash fill mask still
+/// make small per-call allocations (piece lists, flattened indexes), which
+/// the published timings include.
 #[derive(Default, Debug)]
 pub struct AlignedStrokeCtx {
     input: BezPath,
@@ -51,17 +51,17 @@ impl AlignedStrokeCtx {
 
 /// Expand an aligned stroke into a fill outline.
 ///
-/// The result must be interpreted with the **nonzero winding rule**; see the
-/// crate docs for the geometric conventions and alignment semantics.
+/// Interpret the result with the nonzero winding rule. The crate docs give
+/// the geometric conventions and alignment semantics.
 ///
-/// `tolerance` controls the accuracy of curve offsets, joins, and caps, and
+/// `tolerance` controls the accuracy of curve offsets, joins, and caps. It
 /// is also passed to `path`'s [`Shape::path_elements`] conversion. For
-/// display purposes `0.25` works well; use smaller values if the result will
-/// be scaled up.
+/// display purposes `0.25` works well; use smaller values if the result
+/// will be scaled up.
 ///
-/// Never panics on degenerate input: zero width, empty paths, and non-finite
-/// coordinates yield an empty path (non-finite *parameters* additionally
-/// `debug_assert`).
+/// Never panics on degenerate input. Zero width, empty paths, and
+/// non-finite coordinates yield an empty path; non-finite parameters
+/// additionally `debug_assert`.
 pub fn stroke_aligned(path: impl Shape, style: &StrokeStyle, tolerance: f64) -> BezPath {
     let mut ctx = AlignedStrokeCtx::default();
     stroke_aligned_with(path, style, tolerance, &mut ctx);
@@ -110,8 +110,8 @@ pub fn stroke_aligned_with<'a>(
     // Cut positions only need to be accurate to within rendering tolerance;
     // asking for far more drives the subdivision search to full depth.
     let split_accuracy = tolerance.clamp(1e-4, 0.25);
-    // Centered bands don't flip sides across self-intersections (overlaps
-    // are winding-additive, kurbo semantics) — skip the splitting machinery.
+    // Centered bands don't flip sides across self-intersections; overlaps
+    // are winding-additive, kurbo semantics. Skip the splitting machinery.
     let needs_split = !matches!(
         (style.side, style.alignment),
         (Some(StrokeSide::Center), _) | (None, StrokeAlignment::Center)
@@ -129,10 +129,10 @@ pub fn stroke_aligned_with<'a>(
     } = ctx;
 
     // ---- pass 1: decompose into pieces ----------------------------------
-    // A piece is a whole simple subpath, or — when a subpath self-intersects
-    // — one lobe/strand of it (bug-for-bug Figma parity: each lobe resolves
-    // its side against the fill, and independent contours add winding
-    // instead of cancelling; see `split`).
+    // A piece is a whole simple subpath. When a subpath self-intersects it
+    // is one lobe or strand of it, matching Figma: each lobe resolves its
+    // side against the fill, and independent contours add winding instead
+    // of cancelling. See `split`.
     struct Piece {
         els: BezPath,
         closed: bool,
@@ -154,9 +154,9 @@ pub fn stroke_aligned_with<'a>(
         let closed = normalize::is_closed(subpath);
 
         if normalize::is_zero_length(subpath) {
-            // Zero-length subpath: a dot only for Center alignment with Round
-            // caps on both ends (there is no tangent, hence no side and no
-            // orientation for squares). Documented in the crate docs.
+            // Zero-length subpath: a dot, and only for Center alignment
+            // with Round caps on both ends. There is no tangent, so there
+            // is no side and no orientation for a square.
             let center = matches!(
                 (style.side, style.alignment),
                 (Some(StrokeSide::Center), _) | (None, StrokeAlignment::Center)
@@ -228,25 +228,26 @@ pub fn stroke_aligned_with<'a>(
     }
     // ---- pass 3: expand --------------------------------------------------
     // Closed contours with a one-sided band are built set-theoretically:
-    // `Inside(w) = F \ E`, `Outside(w) = D \ F` (Figma's model), where E and
-    // D are the erosion and dilation of the fill by w. So the emission is the
-    // source contours plus the eroded/dilated boundary wound the other way.
-    // Past the local thickness the erosion vanishes and the stroke saturates
-    // — it fills the shape — instead of folding over itself. See `region`.
+    // `Inside(w) = F \ E`, `Outside(w) = D \ F` (Figma's model), where E
+    // and D are the erosion and dilation of the fill by w. The emission is
+    // therefore the source contours plus the eroded or dilated boundary,
+    // wound the other way. Past the local thickness the erosion vanishes
+    // and the stroke saturates: it fills the shape instead of folding over
+    // itself. See `region`.
     //
-    // The winding arithmetic needs the fill expressed with winding +1, so the
-    // contours are normalised: outer-like boundaries clockwise, holes
-    // counter-clockwise (the filled set is unchanged).
+    // The winding arithmetic needs the fill expressed with winding +1, so
+    // the contours are normalised: outer-like boundaries clockwise, holes
+    // counter-clockwise. The filled set is unchanged.
     let region_ix: Vec<usize> = pieces
         .iter()
         .enumerate()
         .filter(|(_, p)| p.closed && p.side != StrokeSide::Center)
         .map(|(i, _)| i)
         .collect();
-    // The set formulation needs every one-sided closed band to face the fill
-    // the same way (always true for Inside/Outside; a raw `side` override on
-    // a compound path can disagree, and then each contour keeps the direct
-    // band construction).
+    // The set formulation needs every one-sided closed band to face the
+    // fill the same way. Inside/Outside always do. A raw `side` override on
+    // a compound path can disagree; each contour then keeps the direct band
+    // construction.
     let uniform_fill_side = region_ix
         .iter()
         .filter_map(|&i| pieces[i].fill_side.map(|f| f == pieces[i].side))
@@ -317,14 +318,14 @@ pub fn stroke_aligned_with<'a>(
 
     // ---- centered set construction ---------------------------------------
     // A centered band's inner boundary inverts once w/2 exceeds the local
-    // thickness, and its winding then cancels interior coverage (a circle
-    // stroked wider than its diameter grew a hole in the middle). Solid
+    // thickness, and its winding then cancels interior coverage: a circle
+    // stroked wider than its diameter grew a hole in the middle. Solid
     // centered bands on closed simple contours are therefore built
-    // set-theoretically too: Center(w) = D_{w/2} \ E_{w/2}, the fill dilated
-    // minus the fill eroded — which is exactly { p : dist(p, path) ≤ w/2 }.
-    // Self-intersecting contours keep kurbo's winding-additive band
-    // (documented); open subpaths have no fill to erode and keep the direct
-    // band as well.
+    // set-theoretically too. Center(w) = D_{w/2} \ E_{w/2}, the fill
+    // dilated minus the fill eroded, which is { p : dist(p, path) ≤ w/2 }
+    // exactly. Self-intersecting contours keep kurbo's winding-additive
+    // band (a documented limitation). Open subpaths have no fill to erode
+    // and keep the direct band as well.
     let center_ix: Vec<usize> = pieces
         .iter()
         .enumerate()
@@ -394,10 +395,10 @@ pub fn stroke_aligned_with<'a>(
         }
     }
 
-    // Dashed one-sided bands cannot use the region construction (the band is
-    // cut into dashes first), so each dash is expanded directly and masked by
-    // the fill instead — otherwise a band that does not fit the local
-    // geometry escapes it (see `clip`).
+    // Dashed one-sided bands cannot use the region construction, because
+    // the band is cut into dashes first. Each dash is expanded directly and
+    // masked by the fill instead; without the mask, a band that does not
+    // fit the local geometry escapes it. See `clip`.
     let clip_source = (sanitized_dash.is_some() && !normalized.is_empty()).then(|| {
         let mut fill = BezPath::new();
         for els in &normalized {
@@ -455,9 +456,9 @@ pub fn stroke_aligned_with<'a>(
                 output,
             ),
             (Some(d), Some(arcs)) => {
-                // Dash split pieces arc by arc so the pattern phase stays
-                // continuous along the original path; dash caps appear at
-                // crossings (the original endpoints keep their real caps).
+                // Dash split pieces arc by arc, so the pattern phase stays
+                // continuous along the original path. Dash caps appear at
+                // crossings; the original endpoints keep their real caps.
                 for arc in arcs {
                     dash::expand_dashed_subpath(
                         arc.els.elements(),
@@ -697,7 +698,7 @@ mod tests {
         assert!((bb.x0 - expected.x0).abs() < 0.01 && (bb.x1 - expected.x1).abs() < 0.01);
     }
 
-    /// `DoD` #5: reversing winding must not change Inside/Outside output.
+    /// Reversing winding must not change Inside/Outside output.
     #[test]
     fn reversal_invariance() {
         let path = circle().to_path(1e-9);

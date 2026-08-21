@@ -1,28 +1,28 @@
 // Copyright 2026 the kurbo-se Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! One-sided/asymmetric stroke band expansion.
+//! Asymmetric stroke band expansion.
 //!
-//! This is a re-derivation of kurbo's private stroke machinery
-//! (`stroke.rs`, `StrokeCtx`) generalized from the symmetric `±width/2`
-//! offsets to independent per-side distances `(d_left, d_right)`:
+//! A re-derivation of kurbo's private stroke machinery (`stroke.rs`,
+//! `StrokeCtx`), generalized from symmetric `±width/2` offsets to
+//! independent per-side distances `(d_left, d_right)`:
 //!
-//! - the **left** boundary accumulates points offset by `−d_left·n̂`,
-//! - the **right** boundary accumulates points offset by `+d_right·n̂`,
+//! - the left boundary accumulates points offset by `−d_left·n̂`,
+//! - the right boundary accumulates points offset by `+d_right·n̂`,
 //!
-//! where `n̂ = t̂.turn_90()` is the unit right normal (Y-down). With
-//! `(w/2, w/2)` this reproduces centered stroking; with `(0, w)` or `(w, 0)`
-//! one boundary is the source path itself, copied exactly.
+//! where `n̂ = t̂.turn_90()` is the unit right normal in Y-down coordinates.
+//! `(w/2, w/2)` reproduces centered stroking. `(0, w)` or `(w, 0)` makes one
+//! boundary the source path itself, copied exactly.
 //!
-//! Differences from kurbo's stroker, on purpose:
-//! - join/cap arcs honor the caller's tolerance (kurbo hardcodes `1e-3`,
-//!   marked "TODO: scale" upstream);
-//! - a boundary at distance `0` copies source segments verbatim instead of
-//!   calling the offsetter, and skips join emission (its corner *is* the
-//!   joint);
-//! - round start caps are followed by an explicit `ClosePath`.
+//! Three deliberate differences from kurbo's stroker:
 //!
-//! The output is meaningful under the **nonzero winding rule** only.
+//! - Join and cap arcs honor the caller's tolerance. kurbo hardcodes `1e-3`
+//!   there, marked `TODO: scale` upstream.
+//! - A boundary at distance `0` copies source segments verbatim instead of
+//!   calling the offsetter, and emits no join: its corner is the joint.
+//! - Round start caps are followed by an explicit `ClosePath`.
+//!
+//! The output is meaningful only under the nonzero winding rule.
 
 use core::f64::consts::PI;
 
@@ -42,20 +42,20 @@ pub(crate) struct BandParams<'c> {
     pub start_cap: Cap,
     pub end_cap: Cap,
     pub tolerance: f64,
-    /// Join-omission threshold, `2·tolerance / (d_left + d_right)`
-    /// (kurbo's `join_thresh` with `width = d_left + d_right`).
+    /// Join-omission threshold, `2·tolerance / (d_left + d_right)`. This is
+    /// kurbo's `join_thresh` with `width = d_left + d_right`.
     pub join_thresh: f64,
     /// Self-intersection vertices of the piece's source subpath. At these
-    /// corners a one-sided band on the *outer* side of the turn suppresses
-    /// its join fan and routes through the vertex, so sibling lobes tile the
-    /// crossing without invading each other's fill (Figma parity).
+    /// corners a one-sided band on the outer side of the turn suppresses
+    /// its join fan and routes through the vertex, so sibling lobes tile
+    /// the crossing without invading each other's fill, as Figma does.
     pub crossings: &'c [Point],
-    /// Match radius for `crossings` (split accuracy scaled).
+    /// Match radius for `crossings`, scaled from the split accuracy.
     pub crossing_eps: f64,
-    /// Emit the *mathematically raw* offset: no inner-side corner clip and
-    /// no crossing-tip handling, so reflex corners keep their overshoot
-    /// loops. The region pruner (see `region`) removes them by distance,
-    /// which is exact where the local clip is only an approximation.
+    /// Emit the mathematically raw offset: no inner-side corner clip and no
+    /// crossing-tip handling, so reflex corners keep their overshoot loops.
+    /// The region pruner (see `region`) removes them by distance, which is
+    /// exact where the local clip is only an approximation.
     pub raw_offset: bool,
 }
 
@@ -70,8 +70,8 @@ impl BandParams<'_> {
     }
 }
 
-/// Working state of one expansion run. Buffers are borrowed from the caller's
-/// context so repeated runs reuse allocations.
+/// Working state of one expansion run. Buffers are borrowed from the
+/// caller's context so repeated runs reuse allocations.
 pub(crate) struct Band<'a> {
     pub(crate) p: BandParams<'a>,
     left: &'a mut BezPath,
@@ -84,16 +84,17 @@ pub(crate) struct Band<'a> {
     start_norm: Vec2,
     last_pt: Point,
     last_tan: Vec2,
-    /// When set, `finish_*` computes joins/reanchoring but emits nothing and
-    /// leaves the boundary accumulators intact — used by the width-clamp
-    /// probe to inspect a candidate offset boundary.
+    /// When set, `finish_*` computes joins and reanchoring but emits
+    /// nothing, leaving the boundary accumulators intact. The region
+    /// construction uses this to read a raw offset boundary directly.
     pub(crate) suppress_finish: bool,
-    /// Segment-index ranges of *outer-side* join geometry emitted in
+    /// Segment-index ranges of outer-side join geometry emitted in
     /// `raw_offset` mode, each with the fraction of `w` it may legitimately
-    /// come within of its corner: `1` for round joins and miters (both stay
-    /// at or beyond `w`), `cos(φ/2)` for a bevel chord, which cuts the
-    /// corner. The region pruner relaxes the distance test by that factor —
-    /// bounded, so inner-side overshoot at extreme widths stays prunable.
+    /// come within of its corner: `1` for round joins and miters, which
+    /// stay at or beyond `w`, and `cos(φ/2)` for a bevel chord, which cuts
+    /// the corner. The region pruner relaxes the distance test by that
+    /// factor. It is bounded, so inner-side overshoot at extreme widths
+    /// stays prunable.
     pub(crate) left_join_segs: alloc::vec::Vec<(u32, u32, f64)>,
     pub(crate) right_join_segs: alloc::vec::Vec<(u32, u32, f64)>,
 }
@@ -125,16 +126,17 @@ impl<'a> Band<'a> {
         }
     }
 
-    /// Expand a stream of path elements (one or more subpaths, all sharing
-    /// this band's caps). Mirrors kurbo's `stroke_undashed` loop.
+    /// Expand a stream of path elements. One or more subpaths, all sharing
+    /// this band's caps. Mirrors kurbo's `stroke_undashed` loop.
     ///
-    /// Degenerate-input contract: underflow-scale segments (no normalizable
-    /// tangent) are dropped by `normalize::collect_canonical` before any
-    /// element stream reaches this point, so the exact-equality checks below
-    /// only need to catch the exactly coincident points that dashing
-    /// produces (a zero-length dash is a `MoveTo p, LineTo p` pair). The
-    /// closing chord is synthesized *here*, after canonicalization, and can
-    /// still be subnormal — it gets the underflow-aware gate.
+    /// Degenerate input: underflow-scale segments, which have no
+    /// normalizable tangent, are dropped by `normalize::collect_canonical`
+    /// before any element stream reaches here. The exact-equality checks
+    /// below therefore only need to catch the exactly coincident points
+    /// that dashing produces, since a zero-length dash arrives as a
+    /// `MoveTo p, LineTo p` pair. The closing chord is synthesized here,
+    /// after canonicalization, so it can still be subnormal and gets the
+    /// underflow-aware gate.
     pub(crate) fn run(&mut self, els: impl IntoIterator<Item = PathEl>) {
         for el in els {
             let p0 = self.last_pt;
@@ -184,15 +186,16 @@ impl<'a> Band<'a> {
         self.finish_open();
     }
 
-    /// Unit right normal of a (nonzero) tangent.
+    /// Unit right normal of a tangent.
     fn unit_norm(tan: Vec2) -> Vec2 {
         let h = tan.hypot();
         if h == 0.0 {
             // The run() gates keep degenerate segments out, but a tangent
             // can still underflow through the curve fallbacks when every
-            // control point clusters below ~1e-162. No direction is
-            // recoverable there; a zero normal collapses the offset onto
-            // the path (winding-neutral) instead of dividing by zero.
+            // control point clusters below about 1e-162. No direction is
+            // recoverable there. A zero normal collapses the offset onto
+            // the path, which is winding-neutral, instead of dividing by
+            // zero and poisoning the output.
             return Vec2::ZERO;
         }
         tan.turn_90() * (1.0 / h)
@@ -206,10 +209,10 @@ impl<'a> Band<'a> {
     }
 
     fn do_cubic(&mut self, c: CubicBez) {
-        // Degenerate-linear detection, ported from kurbo: project the control
-        // points onto a reference chord; if the polygon is monotone and flat
-        // within tolerance, the cubic is treated as a (possibly cusped) line —
-        // offset_cubic's documented precondition.
+        // Degenerate-linear detection, ported from kurbo. Project the
+        // control points onto a reference chord; if the polygon is monotone
+        // and flat within tolerance, treat the cubic as a line that may
+        // carry cusps. This is offset_cubic's documented precondition.
         let chord = c.p3 - c.p0;
         let mut chord_ref = chord;
         let mut chord_ref_hypot2 = chord_ref.hypot2();
@@ -264,11 +267,12 @@ impl<'a> Band<'a> {
         self.last_pt = c.p3;
     }
 
-    /// A cubic that is actually linear, with possible interior cusps.
+    /// A cubic that is actually linear, possibly with interior cusps.
     ///
-    /// `p` holds the control points projected onto the reference chord;
-    /// `ref_pt`/`ref_vec` map projections back to points. Cusps are modeled
-    /// as the limit of finite curvature: forced round joins (Nehab).
+    /// `p` holds the control points projected onto the reference chord.
+    /// `ref_pt` and `ref_vec` map projections back to points. Cusps are
+    /// modeled as the limit of finite curvature, which forces round joins
+    /// (Nehab).
     fn do_linear(&mut self, c: CubicBez, p: [f64; 4], ref_pt: Point, ref_vec: Vec2) {
         let saved_join = self.p.join;
         self.p.join = Join::Round;
@@ -286,7 +290,7 @@ impl<'a> Band<'a> {
                 let mt = 1.0 - t;
                 let z = mt * (mt * mt * p[0] + 3.0 * t * (mt * p[1] + t * p[2])) + t * t * t * p[3];
                 let p = ref_pt + z * ref_vec;
-                // Underflow-aware (like the run() gates): a sub-resolution
+                // Underflow-aware, like the run() gates: a sub-resolution
                 // hop to the cusp point has no usable tangent.
                 if (p - self.last_pt).hypot2() > 0.0 {
                     let tan = p - self.last_pt;
@@ -328,24 +332,24 @@ impl<'a> Band<'a> {
         if dot > 0.0 && cross.abs() < hypot * self.p.join_thresh {
             return;
         }
-        // One-sided bands: when the offset side is the *inner* side of this
-        // turn and the opposite boundary rides the source path (d == 0), the
-        // strip-end points would poke past the adjacent segment — leaking
-        // paint across the source boundary (an inside stroke escaping the
-        // fill). Clip the boundary at the offset-line intersection instead.
-        // The styled join belongs to the outer side, which has no geometry
-        // here, so the clip replaces the whole join. When the clip point
-        // overshoots the neighboring strips (segments short relative to the
-        // width — tight polyline corners), fall back to kurbo's additive
-        // routing through the joint center: it may overpaint, but overlaps
-        // add winding instead of cancelling.
+        // One-sided bands: when the offset side is the inner side of this
+        // turn and the opposite boundary rides the source path (d == 0),
+        // the strip-end points would poke past the adjacent segment,
+        // leaking paint across the source boundary — an inside stroke
+        // escaping the fill. Clip the boundary at the offset-line
+        // intersection instead. The styled join belongs to the outer side,
+        // which has no geometry here, so the clip replaces the whole join.
+        // When the clip point overshoots the neighboring strips — segments
+        // short relative to the width, as at tight polyline corners — fall
+        // back to kurbo's additive routing through the joint center. That
+        // may overpaint, but overlaps add winding instead of cancelling.
         let one_sided_outer_left =
             !self.p.raw_offset && cross > 0.0 && self.p.d_left > 0.0 && self.p.d_right == 0.0;
         let one_sided_outer_right =
             !self.p.raw_offset && cross < 0.0 && self.p.d_right > 0.0 && self.p.d_left == 0.0;
         if (one_sided_outer_left || one_sided_outer_right) && self.p.at_crossing(p0) {
-            // Crossing tip: no join fan; route through the vertex so the
-            // sibling lobe's band can tile the other side of the crossing.
+            // Crossing tip: emit no join fan and route through the vertex,
+            // so the sibling lobe's band can tile the other side of it.
             if one_sided_outer_left {
                 self.left.line_to(p0);
                 self.left.line_to(p0 - nl);
@@ -356,8 +360,8 @@ impl<'a> Band<'a> {
             return;
         }
         // Raw-offset mode: remember which segments the outer-side join is
-        // about to emit, so the region pruner can exempt them from the
-        // distance test (see the field docs).
+        // about to emit, so the region pruner can relax the distance test
+        // over them. See the field docs on `left_join_segs`.
         let tag_left = self.p.raw_offset && cross > 0.0 && self.p.d_left > 0.0;
         let tag_right = self.p.raw_offset && cross < 0.0 && self.p.d_right > 0.0;
         let (l0, r0) = (self.left.elements().len(), self.right.elements().len());
@@ -379,8 +383,8 @@ impl<'a> Band<'a> {
             }
         };
         if self.p.raw_offset {
-            // Raw mode: fall through to the plain join emission below, which
-            // bevels the inner side (the overshoot loop the pruner needs).
+            // Fall through to the plain join emission below, which bevels
+            // the inner side and leaves the overshoot loop the pruner needs.
         } else if cross > 0.0 && self.p.d_left == 0.0 && self.p.d_right > 0.0 {
             // Right side is inner (right turn).
             if self.inner_clip(ab, cd, cross, p0, nr, false) {
@@ -400,8 +404,9 @@ impl<'a> Band<'a> {
             }
             Join::Miter => {
                 if miter_ok {
-                    // Miter on the outer side; the inner side routes through
-                    // the joint center (nonzero winding cancels the overlap).
+                    // Miter on the outer side. The inner side routes
+                    // through the joint center; nonzero winding cancels the
+                    // resulting overlap.
                     if cross > 0.0 && self.p.d_left > 0.0 {
                         let last_n = Self::unit_norm(ab);
                         let fp_last = p0 - self.p.d_left * last_n;
@@ -463,19 +468,19 @@ impl<'a> Band<'a> {
         }
     }
 
-    /// Inner-side clip for one-sided bands (see `do_join`).
+    /// Inner-side clip for one-sided bands. See `do_join` for why.
     ///
-    /// Replaces the strip-end points around the corner with the intersection
-    /// of the two offset lines: `X = fp_this − cd·h`, the same construction
-    /// as the outer miter but on the inner side and unlimited. For a corner
-    /// between two line segments this is exact — the incoming strip end
-    /// (a `LineTo`) is rewritten to `X` and the outgoing offset line passes
-    /// through `X` on its way to the next point. Curve neighbors re-connect
-    /// via a healing line in `do_cubic`, keeping a bounded remnant of the
-    /// poke (documented limitation).
+    /// Replaces the strip-end points around the corner with the
+    /// intersection of the two offset lines, `X = fp_this − cd·h`. This is
+    /// the outer miter's construction, applied to the inner side and
+    /// unlimited. For a corner between two line segments it is exact: the
+    /// incoming strip end (a `LineTo`) is rewritten to `X`, and the
+    /// outgoing offset line passes through `X` on its way to the next
+    /// point. Curve neighbours reconnect through a healing line in
+    /// `do_cubic`, which leaves a bounded remnant of the poke.
     ///
-    /// Returns `false` (caller falls back to the regular join) for
-    /// near-reversals, where the intersection shoots off to infinity.
+    /// Returns `false` for near-reversals, where the intersection shoots
+    /// off to infinity; the caller then falls back to the regular join.
     fn inner_clip(
         &mut self,
         ab: Vec2,
@@ -491,11 +496,12 @@ impl<'a> Band<'a> {
         let fp_last = p0 + sign * d * last_n;
         let fp_this = p0 + sign * n_new;
         let delta = fp_this - fp_last;
-        // X = fp_last + ab·g = fp_this + cd·(−h). The clip is only valid when
-        // it lands within both adjacent strips (g, h ∈ [−1, 0], measured in
-        // tangent lengths — exact for line neighbors); overshoot means the
-        // segments are short relative to the width and cutting would zigzag
-        // the boundary backwards, creating winding-cancellation pockets.
+        // X = fp_last + ab·g = fp_this + cd·(−h). The clip is only valid
+        // when it lands within both adjacent strips: g, h ∈ [−1, 0],
+        // measured in tangent lengths, which is exact for line neighbours.
+        // Overshoot means the segments are short relative to the width, and
+        // cutting would zigzag the boundary backwards into
+        // winding-cancellation pockets.
         let h = ab.cross(delta) / cross;
         let g = delta.cross(cd) / cross;
         const SLACK: f64 = 1e-9;
@@ -503,8 +509,8 @@ impl<'a> Band<'a> {
             return false;
         }
         let x = fp_this - cd * h;
-        // Reversal guard: near 180° the intersection runs away; the poke
-        // there is the U-turn band itself, handled by the regular join.
+        // Reversal guard: near 180° the intersection runs away. The poke
+        // there is the U-turn band itself, which the regular join handles.
         const CLIP_LIMIT: f64 = 1e4;
         if !x.is_finite() || (x - p0).hypot2() > (CLIP_LIMIT * d) * (CLIP_LIMIT * d) {
             return false;
@@ -533,7 +539,7 @@ impl<'a> Band<'a> {
     }
 
     /// Close out an open subpath: left boundary, end cap, reversed right
-    /// boundary, start cap.
+    /// boundary, then start cap.
     fn finish_open(&mut self) {
         if self.left.elements().is_empty() || self.suppress_finish {
             return;
@@ -571,8 +577,8 @@ impl<'a> Band<'a> {
         self.right.truncate(0);
     }
 
-    /// Close out a closed subpath: two closed contours (left forward, right
-    /// reversed) forming a ring under the nonzero rule.
+    /// Close out a closed subpath: two contours, left forward and right
+    /// reversed, forming a ring under the nonzero rule.
     fn finish_closed(&mut self) {
         if self.left.elements().is_empty() {
             return;
@@ -595,11 +601,13 @@ impl<'a> Band<'a> {
     }
 }
 
-/// After an inner-clipped seam join, a ring accumulator ends at the clip
-/// point instead of back at its `MoveTo` start; the implicit closing chord
-/// would retrace a sliver along the first offset line (winding-neutral but
-/// visible in wireframes). When the first drawn element is a line — the clip
-/// point provably lies on it — start the ring at the clip point instead.
+/// Re-anchor a ring whose seam join was inner-clipped.
+///
+/// Such a ring ends at the clip point rather than back at its `MoveTo`
+/// start, so the implicit closing chord retraces a sliver along the first
+/// offset line. That is winding-neutral but shows up in wireframes. When
+/// the first drawn element is a line, the clip point provably lies on it,
+/// so the ring can start there instead.
 fn reanchor_clipped_seam(path: &mut BezPath) {
     let els = path.elements();
     if els.len() < 2 || !matches!(els[1], PathEl::LineTo(_)) {
@@ -618,8 +626,9 @@ fn reanchor_clipped_seam(path: &mut BezPath) {
 
 /// Robust endpoint tangents of a path segment.
 ///
-/// Port of kurbo's `pub(crate) PathSeg::tangents` (an upstream visibility PR
-/// is planned); falls back across coincident control points.
+/// A port of kurbo's `pub(crate) PathSeg::tangents`, which falls back
+/// across coincident control points. `upstream/01-expose-tangents.md`
+/// drafts the PR that would make it public.
 pub(crate) fn tangents(seg: &PathSeg) -> (Vec2, Vec2) {
     const EPS: f64 = 1e-12;
     match seg {
@@ -655,9 +664,9 @@ pub(crate) fn tangents(seg: &PathSeg) -> (Vec2, Vec2) {
 }
 
 /// Connect `side`'s current endpoint to `offset`'s start point if they
-/// differ (they coincide exactly after a regular join; an inner clip leaves
-/// the boundary at the clip point instead, and curve offsets must start from
-/// their true offset origin).
+/// differ. They coincide exactly after a regular join. An inner clip leaves
+/// the boundary at the clip point instead, and a curve offset has to start
+/// from its true offset origin.
 fn heal_start(side: &mut BezPath, offset: &BezPath) {
     if let (Some(PathEl::MoveTo(start)), Some(current)) = (
         offset.elements().first(),
@@ -682,8 +691,9 @@ fn extend_reversed(out: &mut BezPath, elements: &[PathEl]) {
     }
 }
 
-/// Half-circle cap; `norm` points from the band midpoint to the arc's start
-/// (the boundary the output currently sits on) and its length is the radius.
+/// Half-circle cap. `norm` points from the band midpoint to the arc's
+/// start, which is the boundary the output currently sits on, and its
+/// length is the radius.
 pub(crate) fn round_cap(out: &mut BezPath, tolerance: f64, center: Point, norm: Vec2) {
     round_join(out, tolerance, center, norm, PI);
 }
@@ -703,7 +713,7 @@ fn round_join_rev(out: &mut BezPath, tolerance: f64, center: Point, norm: Vec2, 
     arc.to_cubic_beziers(tolerance, |p1, p2, p3| out.curve_to(a * p1, a * p2, a * p3));
 }
 
-/// Square cap; same `norm` convention as [`round_cap`].
+/// Square cap. Same `norm` convention as [`round_cap`].
 pub(crate) fn square_cap(out: &mut BezPath, close: bool, center: Point, norm: Vec2) {
     let a = Affine::new([norm.x, norm.y, -norm.y, norm.x, center.x, center.y]);
     out.line_to(a * Point::new(1.0, 1.0));
