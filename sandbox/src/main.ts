@@ -28,8 +28,8 @@ type DebugOut = {
 
 const state = {
   shapeIx: 4,
-  width: 12,
-  alignment: "inside" as "center" | "inside" | "outside",
+  width: 10,
+  alignment: "center" as "center" | "inside" | "outside",
   side: "auto" as "auto" | "left" | "center" | "right",
   join: "miter" as "miter" | "bevel" | "round",
   miterAngle: 28.96,
@@ -42,6 +42,9 @@ const state = {
   dashCap: "none" as "none" | "round" | "square",
   animate: false,
   tolerance: 0.01,
+  shapeFill: true,
+  fillColor: "#ffffff",
+  strokeColor: "#0056d6",
   layers: {
     fill: true,
     evenodd: false,
@@ -52,6 +55,7 @@ const state = {
     ref: false,
   },
   view: { x: 0, y: 0, w: 300, h: 300 },
+  fitW: 300,
 };
 
 let shapes: GalleryEntry[] = [];
@@ -120,6 +124,18 @@ function parseD(d: string): Parsed {
     }
   }
   return { anchors, controls, firstDir };
+}
+
+/// The `d` restricted to closed subpaths. SVG fills open subpaths as if
+/// implicitly closed, which would paint phantom areas under open polylines —
+/// the crate's fill semantics give open subpaths no fill at all. kurbo's
+/// `to_svg` emits absolute commands, so subpaths start at each `M` and a
+/// closed one contains a `Z`.
+function closedSubpathsD(d: string): string {
+  return d
+    .split(/(?=M)/)
+    .filter((sub) => /Z/i.test(sub))
+    .join("");
 }
 
 // ---------- DOM helpers ----------
@@ -231,6 +247,27 @@ const CAPS: ["none" | "round" | "square", string][] = [
   ["square", "Square"],
 ];
 
+function colorRow(label: string, get: () => string, set: (v: string) => void): HTMLElement {
+  const c = h("input", { type: "color" });
+  c.value = get();
+  const hex = h("span", { class: "hex", textContent: get() });
+  c.oninput = () => {
+    set(c.value);
+    hex.textContent = c.value;
+    render();
+  };
+  return row(label, c, hex);
+}
+
+function checkbox(get: () => boolean, set: (v: boolean) => void): HTMLElement {
+  const c = h("input", { type: "checkbox", checked: get() });
+  c.onchange = () => {
+    set(c.checked);
+    render();
+  };
+  return c;
+}
+
 function buildPanel() {
   const panel = document.getElementById("panel")!;
   panel.replaceChildren(
@@ -250,7 +287,13 @@ function buildPanel() {
       ),
     ),
     group(
+      "Fill",
+      row("Show fill", checkbox(() => state.shapeFill, (v) => (state.shapeFill = v))),
+      colorRow("Color", () => state.fillColor, (v) => (state.fillColor = v)),
+    ),
+    group(
       "Stroke",
+      colorRow("Color", () => state.strokeColor, (v) => (state.strokeColor = v)),
       row("Alignment", segmented([["inside", "Inside"], ["center", "Center"], ["outside", "Outside"]], () => state.alignment, (v) => (state.alignment = v))),
       row("Side (raw)", segmented([["auto", "Auto"], ["left", "L"], ["center", "C"], ["right", "R"]], () => state.side, (v) => (state.side = v))),
       row("Weight", ...slider(0, 60, 0.5, () => state.width, (v) => (state.width = v))),
@@ -289,7 +332,7 @@ function buildPanel() {
         { class: "checks" },
         ...(
           [
-            ["fill", "Result fill"],
+            ["fill", "Stroke result"],
             ["evenodd", "Even-odd rule (artifact x-ray)"],
             ["wire", "Result wireframe + nodes"],
             ["src", "Source path + control points"],
@@ -351,15 +394,26 @@ function render() {
     `${state.view.x} ${state.view.y} ${state.view.w} ${state.view.h}`,
   );
 
-  // Result fill.
+  // The source shape's own fill, under everything. Open subpaths have no
+  // fill (SVG would implicitly close them and paint phantom areas).
+  const shapeFill = layer("layer-shapefill");
+  shapeFill.replaceChildren();
+  const fillD = closedSubpathsD(shape.d);
+  if (state.shapeFill && fillD) {
+    shapeFill.append(
+      svgEl("path", { d: fillD, fill: state.fillColor, "fill-rule": "nonzero" }),
+    );
+  }
+
+  // Stroke result.
   const fill = layer("layer-fill");
   fill.replaceChildren();
   if (state.layers.fill && debug.outputD) {
     fill.append(
       svgEl("path", {
         d: debug.outputD,
-        fill: "#6ea8fe",
-        "fill-opacity": 0.45,
+        fill: state.strokeColor,
+        "fill-opacity": 0.92,
         "fill-rule": state.layers.evenodd ? "evenodd" : "nonzero",
       }),
     );
@@ -373,7 +427,7 @@ function render() {
     const attrs: Record<string, string | number> = {
       d: shape.d,
       fill: "none",
-      stroke: "#ff5c5c",
+      stroke: "#ff6b6b",
       "stroke-opacity": 0.6,
       "stroke-width": state.width,
       "stroke-linecap": capMap[state.startCap],
@@ -395,14 +449,14 @@ function render() {
       svgEl("path", {
         d: debug.outputD,
         fill: "none",
-        stroke: "#d7dae0",
+        stroke: "#8f99ad",
         "stroke-width": px(1),
       }),
     );
     const parsed = parseD(debug.outputD);
     for (const sub of parsed.anchors)
       for (const [x, y] of sub)
-        wire.append(svgEl("circle", { cx: x, cy: y, r: px(1.6), fill: "#d7dae0" }));
+        wire.append(svgEl("circle", { cx: x, cy: y, r: px(1.6), fill: "#8f99ad" }));
   }
 
   // Source path + control points.
@@ -413,7 +467,7 @@ function render() {
       svgEl("path", {
         d: shape.d,
         fill: "none",
-        stroke: "#3ddc84",
+        stroke: "#4cd6a0",
         "stroke-width": px(1),
         "stroke-dasharray": `${px(4)} ${px(3)}`,
       }),
@@ -421,13 +475,13 @@ function render() {
     const parsed = parseD(shape.d);
     for (const [cx, cy, ax, ay] of parsed.controls) {
       src.append(
-        svgEl("line", { x1: cx, y1: cy, x2: ax, y2: ay, stroke: "#3ddc84", "stroke-opacity": 0.4, "stroke-width": px(0.7) }),
-        svgEl("circle", { cx, cy, r: px(1.8), fill: "none", stroke: "#3ddc84", "stroke-width": px(0.8) }),
+        svgEl("line", { x1: cx, y1: cy, x2: ax, y2: ay, stroke: "#4cd6a0", "stroke-opacity": 0.4, "stroke-width": px(0.7) }),
+        svgEl("circle", { cx, cy, r: px(1.8), fill: "none", stroke: "#4cd6a0", "stroke-width": px(0.8) }),
       );
     }
     for (const sub of parsed.anchors)
       for (const [x, y] of sub)
-        src.append(svgEl("rect", { x: x - px(1.6), y: y - px(1.6), width: px(3.2), height: px(3.2), fill: "#3ddc84" }));
+        src.append(svgEl("rect", { x: x - px(1.6), y: y - px(1.6), width: px(3.2), height: px(3.2), fill: "#4cd6a0" }));
   }
 
   // Direction arrows + orientation/side badges.
@@ -449,7 +503,7 @@ function render() {
         dir.append(
           svgEl("path", {
             d: `M ${tipX} ${tipY} L ${tipX - ux * s * 0.55 - uy * s * 0.3} ${tipY - uy * s * 0.55 + ux * s * 0.3} L ${tipX - ux * s * 0.55 + uy * s * 0.3} ${tipY - uy * s * 0.55 - ux * s * 0.3} Z`,
-            fill: "#ffc857",
+            fill: "#f2c14e",
           }),
         );
       }
@@ -460,7 +514,7 @@ function render() {
         x: sx + px(6),
         y: sy - px(6),
         "font-size": px(9),
-        fill: "#ffc857",
+        fill: "#f2c14e",
       });
       t.textContent = label;
       dir.append(t);
@@ -478,7 +532,7 @@ function render() {
           cy: j.y,
           r: px(3),
           fill: "none",
-          stroke: j.fellBack ? "#ff8c42" : "#3ddc84",
+          stroke: j.fellBack ? "#ff9a4d" : "#4cd6a0",
           "stroke-width": px(1),
           "stroke-opacity": 0.9,
         }),
@@ -486,21 +540,41 @@ function render() {
     }
   }
 
-  // Stats.
+  // Stats bar.
   const stats = document.getElementById("stats")!;
-  const sub = debug.subpaths
-    .map(
-      (s, i) =>
-        `  ${i}: ${s.closed ? "closed" : "open"}${s.zeroLength ? " zero" : ""} area ${s.area.toFixed(1)} side ${s.side}`,
-    )
-    .join("\n");
-  stats.innerHTML = debug.error
-    ? `<span class="err">${debug.error}</span>`
-    : `<b>${shapes[state.shapeIx].name}</b>\n` +
-      `segs in ${debug.inputSegs} → out <b>${debug.outputSegs}</b>\n` +
-      `expand <b>${lastExpandMs.toFixed(2)} ms</b>  tol ${state.tolerance}\n` +
-      `miter limit ${debug.miterLimit.toFixed(3)}\n` +
-      sub;
+  stats.replaceChildren();
+  if (debug.error) {
+    stats.append(h("span", { class: "err", textContent: debug.error }));
+  } else {
+    const item = (html: string) => {
+      const el = h("span");
+      el.innerHTML = html;
+      return el;
+    };
+    stats.append(
+      item(`<b>${shapes[state.shapeIx].name}</b>`),
+      item(`segs ${debug.inputSegs} → <b>${debug.outputSegs}</b>`),
+      item(`expand <b>${lastExpandMs.toFixed(2)} ms</b>`),
+      item(`tol ${state.tolerance}`),
+      item(`miter limit ${debug.miterLimit.toFixed(3)}`),
+      ...debug.subpaths.map((sp, i) => {
+        const kind = sp.zeroLength
+          ? "zero"
+          : sp.closed
+            ? `closed ${sp.area >= 0 ? "CW+" : "CCW−"}`
+            : "open";
+        const el = h("span", { class: "chip" });
+        el.innerHTML = `<b>#${i}</b> ${kind} · side ${sp.side[0].toUpperCase()} · area ${sp.area.toFixed(1)}`;
+        return el;
+      }),
+    );
+  }
+  updateZoomPct();
+}
+
+function updateZoomPct() {
+  const el = document.getElementById("zoom-pct");
+  if (el) el.textContent = `${Math.round((state.fitW / state.view.w) * 100)}%`;
 }
 
 // ---------- view control ----------
@@ -513,26 +587,129 @@ function resetView() {
     w: x1 - x0 + 2 * pad,
     h: y1 - y0 + 2 * pad,
   };
+  state.fitW = state.view.w;
+  render();
+}
+
+/// Zoom range relative to fit: 3%..6400%.
+function clampW(w: number): number {
+  return Math.min(Math.max(w, state.fitW / 64), state.fitW / 0.03);
+}
+
+/// Zoom by factor `k` (>1 zooms out) around the viewport fraction (fx, fy).
+function zoomAt(fx: number, fy: number, k: number) {
+  const { x, y, w, h } = state.view;
+  const kk = clampW(w * k) / w;
+  state.view = {
+    x: x + fx * w * (1 - kk),
+    y: y + fy * h * (1 - kk),
+    w: w * kk,
+    h: h * kk,
+  };
   render();
 }
 
 function setupViewControls() {
   const canvas = document.getElementById("canvas")!;
-  canvas.addEventListener("wheel", (e) => {
-    e.preventDefault();
-    const k = e.deltaY > 0 ? 1.15 : 1 / 1.15;
+  const viewport = document.getElementById("viewport")!;
+
+  // All wheel/pinch handling is captured at the window and gated by cursor
+  // COORDINATES, never by event target: Safari hit-tests SVG children and
+  // the SVG root differently, so target-based listeners work over the shape
+  // but not the empty canvas (or the other way round).
+  const overViewport = (x: number, y: number) => {
+    const r = viewport.getBoundingClientRect();
+    return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+  };
+
+  // ---- pinch (Safari WebKit-only gesture events) ----
+  // Fields are not in the TS DOM lib and not guaranteed at runtime; guard
+  // every number — a single NaN in the view blanks the whole canvas.
+  let pinch: { view: typeof state.view; fx: number; fy: number } | null = null;
+  const gesturePoint = (e: Event) => {
     const rect = canvas.getBoundingClientRect();
-    const fx = (e.clientX - rect.left) / rect.width;
-    const fy = (e.clientY - rect.top) / rect.height;
-    const { x, y, w, h } = state.view;
+    const g = e as unknown as { clientX?: number; clientY?: number };
+    const cx =
+      typeof g.clientX === "number" && isFinite(g.clientX)
+        ? g.clientX
+        : rect.left + rect.width / 2;
+    const cy =
+      typeof g.clientY === "number" && isFinite(g.clientY)
+        ? g.clientY
+        : rect.top + rect.height / 2;
+    // Clamp into the viewport so a pinch straying over the panel still
+    // anchors inside the view.
+    return {
+      fx: Math.min(1, Math.max(0, (cx - rect.left) / rect.width)),
+      fy: Math.min(1, Math.max(0, (cy - rect.top) / rect.height)),
+    };
+  };
+  const onGestureStart = (e: Event) => {
+    e.preventDefault(); // never let Safari pinch-zoom the page itself
+    // Anchor the whole pinch at its start point: `scale` is cumulative
+    // since gesturestart, so a per-event anchor would drift.
+    pinch = { view: { ...state.view }, ...gesturePoint(e) };
+  };
+  const onGestureChange = (e: Event) => {
+    e.preventDefault();
+    if (!pinch) return;
+    const scale = (e as unknown as { scale?: number }).scale;
+    if (typeof scale !== "number" || !isFinite(scale) || scale <= 0) return;
+    const w = clampW(pinch.view.w / scale);
+    const h = pinch.view.h * (w / pinch.view.w);
+    // Keep the world point under the fingers fixed.
     state.view = {
-      x: x + fx * w * (1 - k),
-      y: y + fy * h * (1 - k),
-      w: w * k,
-      h: h * k,
+      x: pinch.view.x + pinch.fx * (pinch.view.w - w),
+      y: pinch.view.y + pinch.fy * (pinch.view.h - h),
+      w,
+      h,
     };
     render();
+  };
+  const onGestureEnd = (e: Event) => {
+    e.preventDefault();
+    pinch = null;
+  };
+  window.addEventListener("gesturestart", onGestureStart as EventListener, {
+    passive: false,
+    capture: true,
   });
+  window.addEventListener("gesturechange", onGestureChange as EventListener, {
+    passive: false,
+    capture: true,
+  });
+  window.addEventListener("gestureend", onGestureEnd as EventListener, {
+    passive: false,
+    capture: true,
+  });
+
+  // ---- wheel ----
+  // Figma-style: two-finger scroll pans; pinch (or ctrl/⌘ + scroll) zooms
+  // toward the cursor. Chrome/Firefox deliver trackpad pinches as ctrl+wheel
+  // with small deltas; a real mouse wheel notch is ±100+, so clamp the
+  // per-event factor to keep both usable.
+  window.addEventListener(
+    "wheel",
+    (e) => {
+      if (!overViewport(e.clientX, e.clientY)) return; // let the panel scroll
+      e.preventDefault();
+      if (pinch) return; // a gesture owns the view right now
+      const rect = canvas.getBoundingClientRect();
+      if (e.ctrlKey || e.metaKey) {
+        const fx = (e.clientX - rect.left) / rect.width;
+        const fy = (e.clientY - rect.top) / rect.height;
+        const k = Math.min(1.5, Math.max(1 / 1.5, Math.exp(e.deltaY * 0.01)));
+        zoomAt(fx, fy, k);
+      } else {
+        const s = state.view.w / rect.width;
+        state.view.x += e.deltaX * s;
+        state.view.y += e.deltaY * s;
+        render();
+      }
+    },
+    { passive: false, capture: true },
+  );
+
   let drag: { x: number; y: number } | null = null;
   canvas.addEventListener("pointerdown", (e) => {
     drag = { x: e.clientX, y: e.clientY };
@@ -548,6 +725,11 @@ function setupViewControls() {
     render();
   });
   canvas.addEventListener("pointerup", () => (drag = null));
+  canvas.addEventListener("dblclick", () => resetView());
+
+  document.getElementById("zoom-in")!.onclick = () => zoomAt(0.5, 0.5, 1 / 1.3);
+  document.getElementById("zoom-out")!.onclick = () => zoomAt(0.5, 0.5, 1.3);
+  document.getElementById("zoom-pct")!.onclick = () => resetView();
 }
 
 // ---------- dash animation ----------
@@ -594,6 +776,13 @@ function applyQueryParams() {
   num("dashOffset", (v) => (state.dashOffset = v));
   str("dashCap", ["none", "round", "square"], (v) => (state.dashCap = v));
   num("tol", (v) => (state.tolerance = v));
+  flag("shapeFill", (v) => (state.shapeFill = v));
+  const color = (k: string, set: (v: string) => void) => {
+    const v = q.get(k);
+    if (v !== null && /^[0-9a-fA-F]{6}$/.test(v)) set(`#${v}`);
+  };
+  color("fillColor", (v) => (state.fillColor = v));
+  color("strokeColor", (v) => (state.strokeColor = v));
   for (const k of Object.keys(state.layers) as (keyof typeof state.layers)[]) {
     flag(k, (v) => (state.layers[k] = v));
   }

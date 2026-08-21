@@ -1,10 +1,15 @@
 :root {
-  --bg: #16181d;
-  --panel: #1e2128;
-  --line: #2c313a;
-  --text: #d7dae0;
-  --muted: #8b919c;
-  --accent: #6ea8fe;
+  --bg: #0b0d12;
+  --panel: #12151c;
+  --field: #1a1f2a;
+  --line: #232937;
+  --line-soft: #1c212d;
+  --text: #e8ebf2;
+  --muted: #97a0b4;
+  --faint: #626b7f;
+  --accent: #7aa2ff;
+  --accent-ink: #0b1020;
+  --danger: #ff7a7a;
   color-scheme: dark;
 }
 
@@ -14,137 +19,259 @@
 
 body {
   margin: 0;
+  overscroll-behavior: none;
   display: flex;
   height: 100vh;
-  font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  font: 13px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   background: var(--bg);
   color: var(--text);
+  -webkit-font-smoothing: antialiased;
 }
 
+/* ---------- panel ---------- */
+
 #panel {
-  width: 300px;
-  min-width: 300px;
+  width: 292px;
+  min-width: 292px;
   overflow-y: auto;
   background: var(--panel);
   border-right: 1px solid var(--line);
-  padding: 12px 14px 40px;
+  padding: 14px 16px 48px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--line) transparent;
 }
 
 #panel h1 {
-  font-size: 14px;
-  margin: 2px 0 10px;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0.01em;
+  margin: 2px 0 14px;
 }
 #panel h1 span {
-  color: var(--muted);
-  font-weight: normal;
+  color: var(--faint);
+  font-weight: 450;
 }
 
 .group {
-  border-top: 1px solid var(--line);
-  padding: 10px 0;
+  border-top: 1px solid var(--line-soft);
+  padding: 12px 0 10px;
 }
 .group > .title {
-  font-size: 11px;
+  font-size: 10.5px;
+  font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--muted);
-  margin-bottom: 8px;
+  letter-spacing: 0.09em;
+  color: var(--faint);
+  margin-bottom: 9px;
 }
 
 .row {
   display: flex;
   align-items: center;
   gap: 8px;
-  margin: 6px 0;
+  margin: 7px 0;
+  min-height: 26px;
 }
 .row label {
-  flex: 0 0 84px;
+  flex: 0 0 82px;
   color: var(--muted);
 }
+
+/* ---------- controls ---------- */
+
 .row input[type="range"] {
   flex: 1;
+  min-width: 0;
   accent-color: var(--accent);
 }
 .row input[type="number"] {
-  width: 64px;
+  width: 60px;
+  text-align: right;
 }
 .row select {
   flex: 1;
+  min-width: 0;
 }
 
 input[type="number"],
 select {
-  background: #14161b;
+  background: var(--field);
   color: var(--text);
   border: 1px solid var(--line);
-  border-radius: 5px;
-  padding: 3px 6px;
+  border-radius: 7px;
+  padding: 4px 7px;
+  font: inherit;
+  outline: none;
+}
+input[type="number"]:focus-visible,
+select:focus-visible {
+  border-color: var(--accent);
+}
+
+input[type="color"] {
+  width: 28px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+}
+input[type="color"]::-webkit-color-swatch-wrapper {
+  padding: 2px;
+}
+input[type="color"]::-webkit-color-swatch {
+  border: none;
+  border-radius: 4px;
+}
+.hex {
+  color: var(--faint);
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  text-transform: uppercase;
 }
 
 .seg {
   display: flex;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  overflow: hidden;
   flex: 1;
+  min-width: 0;
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
 }
 .seg button {
   flex: 1;
+  min-width: 0;
   background: transparent;
   color: var(--muted);
   border: none;
-  padding: 5px 0;
+  border-radius: 6px;
+  padding: 4px 0;
   cursor: pointer;
   font: inherit;
+  font-size: 12px;
+}
+.seg button:hover {
+  color: var(--text);
 }
 .seg button.on {
   background: var(--accent);
-  color: #10131a;
+  color: var(--accent-ink);
+  font-weight: 600;
 }
 
 .checks label {
   display: flex;
-  gap: 7px;
+  gap: 8px;
   align-items: center;
-  margin: 4px 0;
-  color: var(--text);
+  margin: 5px 0;
+  color: var(--muted);
   cursor: pointer;
 }
-.checks input {
-  accent-color: var(--accent);
+.checks label:hover {
+  color: var(--text);
 }
+.checks input,
+.row input[type="checkbox"] {
+  accent-color: var(--accent);
+  width: 14px;
+  height: 14px;
+}
+
+/* ---------- stage ---------- */
 
 #stage {
   flex: 1;
-  position: relative;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
 }
+
+#viewport {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  touch-action: none;
+}
+
 #canvas {
   width: 100%;
   height: 100%;
   display: block;
   cursor: grab;
 }
+/* The drawing is display-only. Keeping SVG children out of hit-testing
+   makes every event target the SVG root — Safari's trackpad gesture
+   recognizer silently drops pinches that hit-test onto an SVG child, so
+   pinch-zoom died whenever the cursor was over a painted shape. */
+#canvas * {
+  pointer-events: none;
+}
 #canvas:active {
   cursor: grabbing;
 }
 
-#stats {
+#zoombar {
   position: absolute;
-  right: 10px;
-  top: 10px;
-  background: rgba(20, 22, 27, 0.88);
+  right: 14px;
+  bottom: 14px;
+  display: flex;
+  align-items: center;
+  background: rgba(18, 21, 28, 0.86);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--line);
-  border-radius: 8px;
-  padding: 8px 12px;
-  font: 11px/1.6 ui-monospace, SFMono-Regular, Menlo, monospace;
+  border-radius: 10px;
+  padding: 2px;
+  gap: 1px;
+}
+#zoombar button {
+  background: transparent;
   color: var(--muted);
-  pointer-events: none;
-  white-space: pre;
+  border: none;
+  border-radius: 8px;
+  cursor: pointer;
+  font: 13px/1 inherit;
+  height: 26px;
+  min-width: 26px;
+  padding: 0 6px;
+}
+#zoombar button:hover {
+  color: var(--text);
+  background: var(--field);
+}
+#zoom-pct {
+  font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+  min-width: 52px;
+}
+
+/* ---------- stats bar ---------- */
+
+#stats {
+  border-top: 1px solid var(--line);
+  background: var(--panel);
+  padding: 7px 14px;
+  font: 11px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  column-gap: 18px;
+  row-gap: 2px;
+  min-height: 32px;
+  align-items: center;
 }
 #stats b {
   color: var(--text);
+  font-weight: 600;
+}
+#stats .chip {
+  color: var(--faint);
+}
+#stats .chip b {
+  color: var(--muted);
 }
 
 .err {
-  color: #ff8484;
+  color: var(--danger);
 }

@@ -20,13 +20,14 @@ slower and feels laggy); `npm run build` uses `wasm-pack --release`.
 
 ## What's on screen
 
-- **Panel** mirrors Figma's stroke settings — Alignment (Inside/Center/
-  Outside), raw Side override (Left/Center/Right), Weight, Join + Miter
-  angle (degrees), per-end caps, Dash/Gap/Dash offset/Dash cap — plus a
-  tolerance selector.
-- **Result fill** renders the expanded outline with the **nonzero** rule
-  (the output's contract). Toggle **Even-odd rule** to x-ray the
-  self-overlap structure — artifacts that nonzero cancels become visible.
+- **Panel** mirrors Figma's stroke settings — a Fill group (show/hide +
+  colour), stroke colour, Alignment (Inside/Center/Outside), raw Side
+  override (Left/Center/Right), Weight, Join + Miter angle (degrees),
+  per-end caps, Dash/Gap/Dash offset/Dash cap — plus a tolerance selector.
+- **Stroke result** renders the expanded outline with the **nonzero** rule
+  (the output's contract) in the chosen stroke colour, over the shape's own
+  fill. Toggle **Even-odd rule** to x-ray the self-overlap structure —
+  artifacts that nonzero cancels become visible.
 - **Result wireframe + nodes** shows the outline's raw segments.
 - **Source path + control points** is the input hairline (dashes = green).
 - **Direction, orientation, side** draws a travel arrow at each subpath
@@ -40,16 +41,17 @@ slower and feels laggy); `npm run build` uses `wasm-pack --release`.
   elsewhere: SVG has no per-end caps (the start cap is used for both), no
   alignment, and browsers dash across subpaths while kurbo-se restarts the
   pattern per subpath.
-- **Stats** (top right): input/output segment counts and expansion time.
+- **Stats** (bottom bar): input/output segment counts, expansion time, and
+  per-subpath orientation/side/area chips.
 
-Scroll to zoom, drag to pan.
+Two-finger scroll pans; pinch (or ⌘/ctrl + scroll) zooms toward the cursor;
+drag pans too. The toolbar in the corner zooms in steps, and clicking the
+percentage — or double-clicking the canvas — fits the shape.
 
 ## Gallery
 
 The shapes cover the mission's edge cases: open polyline; open curve with a
 loop/cusp; circle; rectangle; concave star; donut (hole with opposite
-winding); self-intersecting bowtie; **figure-eight** (documented one-lobe-
-grows limitation); zero-length segments; collinear-control-point cubics
-(straight + interior cusp); polyline spiral; the kurbo #344 adversarial
-cubic; a multi-subpath mix (dash-phase demo); and a sharp wedge that
-exercises the inner-side clip.
+winding); self-intersecting bowtie; figure-eight; zero-length segments; a
+smooth spiral; a multi-subpath mix (dash-phase demo); and a sharp wedge
+that exercises the inner-side clip.

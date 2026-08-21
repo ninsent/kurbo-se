@@ -2,7 +2,7 @@
 //! debug JSON out. Deliberately renderer-free (plain SVG on the frontend).
 
 use kurbo_se::kurbo::{
-    self, BezPath, Cap, Circle, CubicBez, Join, ParamCurve, PathEl, PathSeg, Rect, Shape, Vec2,
+    self, BezPath, Cap, Circle, Join, ParamCurve, PathEl, PathSeg, Rect, Shape, Vec2,
 };
 use kurbo_se::{
     DashStyle, StrokeAlignment, StrokeSide, StrokeStyle, analyze_subpaths, miter_angle_to_limit,
@@ -132,8 +132,7 @@ struct JoinDto {
 
 fn parse_inputs(path_d: &str, style_json: &str) -> Result<(BezPath, StrokeStyle), String> {
     let path = BezPath::from_svg(path_d).map_err(|e| format!("path: {e}"))?;
-    let dto: StyleDto =
-        serde_json::from_str(style_json).map_err(|e| format!("style: {e}"))?;
+    let dto: StyleDto = serde_json::from_str(style_json).map_err(|e| format!("style: {e}"))?;
     Ok((path, to_style(&dto)))
 }
 
@@ -295,7 +294,7 @@ fn entry(name: &str, path: BezPath) -> GalleryEntry {
     }
 }
 
-/// The mission gallery, built from kurbo primitives (guaranteed-valid data).
+/// The gallery, built from kurbo primitives (guaranteed-valid data).
 #[wasm_bindgen]
 pub fn gallery() -> String {
     let mut items = Vec::new();
@@ -374,32 +373,31 @@ pub fn gallery() -> String {
     p.line_to((100.0, 160.0));
     items.push(entry("Zero-length segments", p));
 
+    // Archimedean spiral, r = b·θ, as exact Hermite-fitted cubics.
     let mut p = BezPath::new();
-    p.move_to((20.0, 60.0));
-    p.curve_to((80.0, 60.0), (140.0, 60.0), (200.0, 60.0));
-    p.move_to((20.0, 140.0));
-    p.curve_to((240.0, 140.0), (-40.0, 140.0), (180.0, 140.0));
-    items.push(entry("Collinear cubics (+cusps)", p));
-
-    let mut p = BezPath::new();
-    p.move_to((150.0, 150.0));
-    for i in 1..=72 {
-        let a = i as f64 * 0.35;
-        let r = 4.0 + i as f64 * 1.9;
-        p.line_to((150.0 + r * a.cos(), 150.0 + r * a.sin()));
-    }
-    items.push(entry("Spiral (polyline)", p));
-
-    items.push(entry(
-        "kurbo #344 adversarial cubic",
-        CubicBez::new(
-            (51.0, 0.0),
-            (-0.0859375, 161.640625),
-            (0.0, 164.0),
-            (0.0, 164.0),
+    let b = 5.2_f64;
+    let th0 = 1.1_f64;
+    let th1 = 4.25 * core::f64::consts::TAU;
+    let steps = 46_usize;
+    let pos = |th: f64| kurbo::Point::new(150.0 + b * th * th.cos(), 150.0 + b * th * th.sin());
+    let deriv = |th: f64| {
+        Vec2::new(
+            b * (th.cos() - th * th.sin()),
+            b * (th.sin() + th * th.cos()),
         )
-        .into_path(1e-6),
-    ));
+    };
+    let h = (th1 - th0) / steps as f64;
+    p.move_to(pos(th0));
+    for i in 0..steps {
+        let a = th0 + h * i as f64;
+        let z = a + h;
+        p.curve_to(
+            pos(a) + deriv(a) * (h / 3.0),
+            pos(z) - deriv(z) * (h / 3.0),
+            pos(z),
+        );
+    }
+    items.push(entry("Spiral (smooth)", p));
 
     let mut p = BezPath::new();
     p.move_to((20.0, 40.0));

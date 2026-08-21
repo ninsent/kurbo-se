@@ -115,6 +115,14 @@ This changelog follows <https://keepachangelog.com/en/>.
     stitched ~1.4k fuzz segments into the output; a net-area gate now
     collapses region components thinner than the boundary band everywhere
     into clean saturation.
+- Sandbox: redesigned — refreshed palette and panel styling, stats moved to
+  a bottom bar (it no longer overlaps the drawing), Figma-style navigation
+  (two-finger scroll pans, pinch or ⌘/ctrl+scroll zooms toward the cursor,
+  zoom toolbar with fit, double-click to fit, clamped zoom range), a shape
+  Fill toggle with colour pickers for both the fill and the stroke result
+  (URL-shareable), and a pruned gallery: the kurbo #344 cubic and the
+  collinear-cubics entries are gone, and the polyline spiral is now a
+  smooth Hermite-fitted Archimedean spiral.
 - Sandbox: the dev server's wasm now builds with `opt-level = 2` and
   `npm run build` uses `wasm-pack --release` (both previously unoptimized
   `--dev`, the dominant cause of sandbox lag).
