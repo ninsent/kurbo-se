@@ -108,7 +108,7 @@ impl StrokeSide {
 }
 
 /// Which side of a closed subpath faces the filled region of `whole`.
-fn fill_side(subpath: &[PathEl], whole: &BezPath, probe_scale: f64) -> StrokeSide {
+pub(crate) fn fill_side(subpath: &[PathEl], whole: &BezPath, probe_scale: f64) -> StrokeSide {
     // Own-disk side from the subpath's signed area (closing chord included:
     // the slice ends with ClosePath, so `segments` emits it).
     let own_disk_right = subpath.area() >= 0.0;

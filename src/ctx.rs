@@ -346,6 +346,104 @@ pub fn stroke_aligned_with<'a>(
         }
     }
 
+    // ---- centered set construction ---------------------------------------
+    // A centered band's inner boundary inverts once w/2 exceeds the local
+    // thickness, and its winding then cancels interior coverage (a circle
+    // stroked wider than its diameter grew a hole in the middle). Solid
+    // centered bands on closed simple contours are therefore built
+    // set-theoretically too: Center(w) = D_{w/2} \ E_{w/2}, the fill dilated
+    // minus the fill eroded — which is exactly { p : dist(p, path) ≤ w/2 }.
+    // Self-intersecting contours keep kurbo's winding-additive band
+    // (documented); open subpaths have no fill to erode and keep the direct
+    // band as well.
+    let center_ix: Vec<usize> = pieces
+        .iter()
+        .enumerate()
+        .filter(|(i, p)| {
+            sanitized_dash.is_none()
+                && !region_done[*i]
+                && p.closed
+                && p.side == StrokeSide::Center
+                && p.eff_width > 0.0
+                && crate::split::split_self_intersections(p.els.elements(), true, split_accuracy)
+                    .is_none()
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if !center_ix.is_empty() {
+        let half = 0.5 * pieces[center_ix[0]].eff_width;
+        let normalized_c: Vec<BezPath> = center_ix
+            .iter()
+            .map(|&i| {
+                let fill = orient::fill_side(pieces[i].els.elements(), input, probe_scale);
+                normalize_orientation(&pieces[i].els, fill)
+            })
+            .collect();
+        let specs: Vec<crate::region::ContourSpec<'_>> = normalized_c
+            .iter()
+            .map(|els| crate::region::ContourSpec {
+                els: els.elements(),
+                fill_side: StrokeSide::Right,
+            })
+            .collect();
+        let mut region_source = BezPath::new();
+        for els in &normalized_c {
+            region_source.extend(els.iter());
+        }
+        let index =
+            crate::region::SourceIndex::new(&region_source, (half * 1e-3).max(tolerance * 0.1));
+        let base = BandParams {
+            d_left: 0.0,
+            d_right: 0.0,
+            join: style.join,
+            miter_limit,
+            start_cap: style.start_cap,
+            end_cap: style.end_cap,
+            tolerance,
+            join_thresh: 2.0 * tolerance / half.max(1e-12),
+            crossings: &[],
+            crossing_eps: 0.0,
+            raw_offset: true,
+        };
+        let dilation = crate::region::region_loops(
+            &specs,
+            crate::region::RegionKind::Dilation,
+            &index,
+            half,
+            &base,
+            split_accuracy,
+            left,
+            right,
+            scratch,
+            sink,
+        );
+        // The dilation of nondegenerate geometry always exists; if it comes
+        // back empty, fall through to the direct band rather than vanish.
+        if !dilation.is_empty() {
+            let erosion = crate::region::region_loops(
+                &specs,
+                crate::region::RegionKind::Erosion,
+                &index,
+                half,
+                &base,
+                split_accuracy,
+                left,
+                right,
+                scratch,
+                sink,
+            );
+            for l in &dilation {
+                output.extend(l.iter());
+            }
+            for l in &erosion {
+                output.extend(l.reverse_subpaths().iter());
+            }
+            for &i in &center_ix {
+                region_done[i] = true;
+            }
+        }
+    }
+
     // Dashed one-sided bands cannot use the region construction (the band is
     // cut into dashes first), so each dash is expanded directly and masked by
     // the fill instead — otherwise a band that does not fit the local

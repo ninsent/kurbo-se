@@ -37,6 +37,17 @@ This changelog follows <https://keepachangelog.com/en/>.
 
 ### Fixed
 
+- Centered strokes on closed contours grew holes at extreme weights: past
+  `w/2 >` the local thickness the direct band's inner boundary inverts and
+  its winding cancels interior coverage (a circle stroked wider than its
+  diameter had a hole in the middle; a donut's hole contour did the same
+  from `w/2 >` the hole radius). Solid centered bands on closed simple
+  contours are now built set-theoretically like the one-sided ones —
+  `Center(w) = D_{w/2} \ E_{w/2}` — so they saturate instead. Centered
+  strokes on open subpaths, dashed centered strokes, and self-intersecting
+  contours (kurbo winding-additive parity, documented) keep the direct
+  band. Solid centered closed contours now cost the region construction
+  (~50 µs for the 62-segment circle against ~14 µs before).
 - Dashing stopped partway along paths containing degenerate segments: a
   fully coincident `QuadTo` has a `NaN` arc length upstream
   (`QuadBez::arclen`), which poisoned the dash phase so everything past that

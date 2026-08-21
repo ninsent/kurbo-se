@@ -63,6 +63,11 @@ Width profiles are out of scope.
 - **Holes and compounds:** a donut's hole strokes *into the ring*, not into
   the void; opposite-winding and reversed subpaths all behave, and drawing
   direction never changes what `Inside` looks like.
+- **Centered strokes are set-defined too** on closed simple contours:
+  `Center(w) = { p : dist(p, path) ≤ w/2 }`, the fill dilated by `w/2` minus
+  the fill eroded by `w/2`. Past the local thickness the inner boundary
+  saturates instead of inverting — a circle stroked wider than its diameter
+  stays a solid disc rather than growing a hole in the middle.
 - **Self-intersecting contours** (bowtie, figure-eight) are split at their
   crossings and each lobe resolves against the fill separately.
 - **Open subpaths:** inside/outside is geometrically undefined; kurbo-se
@@ -90,15 +95,18 @@ Measured on an Apple-silicon laptop, tolerance 0.25 (criterion, release):
 | Case | time |
 |---|---|
 | 10-point star (lines), inside, solid | 4.4 µs |
-| circle (62 segs), center, solid | 13.6 µs (kurbo's native stroker: 12.6 µs) |
+| circle (62 segs), center, solid | 50 µs (kurbo's native stroker: 12.9 µs) |
 | circle (62 segs), inside, solid | 31 µs |
 | circle, inside, dashed + round dash caps | 54 µs |
 | donut (124 segs, hole), inside, solid | 94 µs |
 | 40-cubic wavy path, inside, solid | 103 µs |
 | 40-cubic wavy path, inside, dashed | 139 µs |
 
-Centered strokes take a direct path and cost about the same as kurbo's own
-stroker. One-sided strokes pay for the region construction, but when the
+Solid centered strokes on closed contours take the same set construction as
+one-sided ones (that is what keeps a circle stroked wider than its diameter
+solid); centered strokes on open subpaths and all dashed centered strokes
+keep the direct path at kurbo-stroker cost. One-sided strokes pay for the
+region construction, but when the
 raw offsets don't intersect — every smooth contour at moderate width — a
 fast path classifies each offset loop whole and skips the cut/prune/stitch
 machinery; polylines — the common UI case — stay in the single-digit
@@ -124,9 +132,11 @@ inside/center/outside stars plus an animated dashed ring headlessly:
 
 Measured there: 120 frames at 900×620, scene build *including all stroke
 expansion* averages **0.034 ms**; the full GPU frame averages 1.6 ms. For
-plain centered solid strokes you can skip kurbo-se at render time:
-`kurbo::Stroke::from(&style)` converts (lossily — alignment and dash caps
-have no kurbo equivalent; documented on the impl).
+plain centered solid strokes at moderate widths you can skip kurbo-se at
+render time: `kurbo::Stroke::from(&style)` converts (lossily — alignment and
+dash caps have no kurbo equivalent, and kurbo's stroker folds over itself
+past the local thickness, which is exactly what kurbo-se's centered
+construction fixes; documented on the impl).
 
 ## Relationship to kurbo
 
@@ -148,6 +158,10 @@ and, gratefully, the design.
   thinner than that band everywhere (the sliver annulus of a donut stroked
   at *exactly* half its ring thickness) collapses to clean saturation
   rather than rendering as sub-tolerance fuzz.
+- **Self-intersecting contours, centered:** centered strokes keep kurbo's
+  winding-additive band on self-intersecting contours (splitting them would
+  change moderate-width output away from kurbo/SVG parity), so at extreme
+  widths their inverted inner boundaries can still cancel.
 - **Interleaved self-intersections:** a contour whose crossings nest
   irregularly (a pretzel) decomposes only partially into lobes; the result
   is still finite, contained and artifact-reduced, but the lobe split is

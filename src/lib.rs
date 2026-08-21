@@ -43,14 +43,18 @@
 //! ```
 //!
 //! where `F` is the filled region of the whole path under the nonzero rule.
-//! Two consequences are worth stating outright:
+//! Centered strokes on closed **simple** contours follow the same model:
+//! `Center(w) = { p : dist(p, path) ≤ w/2 }`, built as the fill dilated by
+//! `w/2` minus the fill eroded by `w/2`. Two consequences are worth stating
+//! outright:
 //!
 //! - an inside stroke **never** leaves the fill and an outside stroke never
 //!   enters it, at any width — dashed strokes included, where each dash is
 //!   expanded and then masked by the fill;
 //! - a width beyond the local thickness **saturates** instead of folding
 //!   over itself — the stroke fills the shape completely, exactly as Figma
-//!   renders it (a rectangle narrower than `2w`, a thin wedge, a small star).
+//!   renders it (a rectangle narrower than `2w`, a thin wedge, a small
+//!   star, a circle stroked wider than its diameter).
 //!
 //! - **Closed subpaths**: `Inside` is the side of the *filled region* of the
 //!   whole compound path (holes stroke into the ring, not into the void).

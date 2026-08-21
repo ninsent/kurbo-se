@@ -71,6 +71,47 @@ fn check(name: &str, path: &BezPath, w: f64, grid: usize) {
     }
 }
 
+/// Check a centered stroke against its set definition,
+/// `Center(w) = { p : dist(p, path) ≤ w/2 }`, independent of the fill.
+///
+/// Round joins for the same reason as [`check`]; holds at any width for
+/// closed simple contours — past the local thickness the band saturates
+/// instead of the inverted inner boundary punching holes (2026-08-21
+/// report: a circle stroked wider than its diameter grew a hole in the
+/// middle).
+fn check_center(name: &str, path: &BezPath, w: f64, grid: usize) {
+    let style = StrokeStyle::new(w)
+        .with_alignment(StrokeAlignment::Center)
+        .with_join(Join::Round);
+    let out = stroke_aligned(path, &style, TOL);
+    assert!(out.is_finite(), "{name}/center: non-finite output");
+
+    let h = 0.5 * w;
+    let bbox = path.bounding_box().inflate(h * 1.2 + 8.0, h * 1.2 + 8.0);
+    let slack = (h * 0.06).max(1.5);
+    let mut checked = 0usize;
+    for iy in 0..grid {
+        for ix in 0..grid {
+            let p = Point::new(
+                bbox.x0 + (ix as f64 + 0.5) / grid as f64 * bbox.width(),
+                bbox.y0 + (iy as f64 + 0.5) / grid as f64 * bbox.height(),
+            );
+            let d = dist_to_path(path, p);
+            if (d - h).abs() < slack {
+                continue;
+            }
+            let want = d <= h;
+            let got = out.winding(p) != 0;
+            assert_eq!(
+                got, want,
+                "{name}/center w={w} at {p:?}: dist {d:.2} — expected painted={want}, got {got}"
+            );
+            checked += 1;
+        }
+    }
+    assert!(checked > grid * grid / 4, "{name}: too few samples checked");
+}
+
 fn star(points: usize, r_outer: f64, r_inner: f64) -> BezPath {
     let mut p = BezPath::new();
     for i in 0..(points * 2) {
@@ -181,6 +222,38 @@ fn thin_wedge() {
     let w = wedge();
     check("wedge", &w, 8.0, 56);
     check("wedge", &w, 60.0, 56); // saturates
+}
+
+/// Centered strokes hold the set contract at any width on closed simple
+/// contours: annulus at moderate widths, solid stadium past the fold
+/// (2026-08-21 report — the direct band's inverted inner boundary used to
+/// cancel interior coverage). Self-intersecting contours keep kurbo's
+/// winding-additive centered band and are deliberately absent here.
+#[test]
+fn centered_set_semantics_all_widths() {
+    let c = Circle::new((120.0, 120.0), 70.0).to_path(1e-7);
+    check_center("circle", &c, 10.0, 56);
+    check_center("circle", &c, 130.0, 48); // annulus, thin hole
+    check_center("circle", &c, 145.0, 48); // w/2 > r: hole must vanish
+    check_center("circle", &c, 300.0, 40); // far past: solid stadium
+
+    let d = donut();
+    check_center("donut", &d, 12.0, 56);
+    check_center("donut", &d, 95.0, 48); // hole contour folds (w/2 > 45)
+    check_center("donut", &d, 240.0, 40); // everything floods
+
+    let rect = Rect::new(40.0, 80.0, 120.0, 140.0).to_path(1e-9);
+    check_center("rect", &rect, 8.0, 56);
+    check_center("rect", &rect, 70.0, 48); // w/2 > short half-side
+    check_center("rect", &rect, 200.0, 40);
+
+    let w = wedge();
+    check_center("wedge", &w, 8.0, 56);
+    check_center("wedge", &w, 60.0, 48);
+
+    let s = star(5, 100.0, 40.0);
+    check_center("star", &s, 10.0, 56);
+    check_center("star", &s, 90.0, 48);
 }
 
 #[test]
