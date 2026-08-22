@@ -1,0 +1,59 @@
+name: Deploy sandbox
+
+# The sandbox is a Vite app whose wasm half is this crate, so a deploy is a
+# Rust build followed by a JS build. Pages serves a project site from
+# /<repo>/, and Vite bakes asset URLs at build time, so the base path has to
+# be passed in or every asset 404s.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Never let two deploys race; queue instead of cancelling so a finished
+# build always lands.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: sandbox/wasm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: sandbox/package-lock.json
+      - name: install wasm-pack
+        run: curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh
+      - name: build
+        working-directory: sandbox
+        run: |
+          npm ci
+          npm run build -- --base=/${GITHUB_REPOSITORY#*/}/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: sandbox/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
