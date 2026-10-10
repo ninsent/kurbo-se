@@ -34,7 +34,7 @@
 //! are rejoined with a straight line, which reproduces bevel-join chords
 //! exactly.
 
-use alloc::collections::{BTreeMap, BTreeSet};
+use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
 use kurbo::{BezPath, ParamCurve, PathEl, PathSeg, Point, Rect, Shape};
@@ -746,15 +746,6 @@ fn substantial_loop(path: &BezPath, accuracy: f64) -> bool {
     path.elements().area().abs() > 2.0 * accuracy * perimeter.max(1.0)
 }
 
-/// Reassemble surviving pieces into closed loops.
-///
-/// At an intersection the surviving strand continues from the same point,
-/// so the walk hands over to whichever unused piece starts there. That
-/// includes a piece belonging to another contour, which is how overlapping
-/// bands merge into a single boundary. Elsewhere — at a dropped bevel
-/// chord or a trimmed spike — it falls through to the next survivor of the
-/// same contour and bridges with a line. For a bevel join that line is the
-/// chord itself.
 /// Bridge chords longer than this multiple of the band width are refused.
 ///
 /// A legitimate bridge replaces dropped join geometry, so it is bounded by
@@ -765,9 +756,25 @@ fn substantial_loop(path: &BezPath, accuracy: f64) -> bool {
 /// loop there yields a visibly missing piece instead of a wrong one.
 const MAX_BRIDGE: f64 = 8.0;
 
+/// Reassemble surviving pieces into closed loops.
+///
+/// At an intersection the surviving strand continues from the same point,
+/// so the walk hands over to whichever unused piece starts there. That
+/// includes a piece belonging to another contour, which is how overlapping
+/// bands merge into a single boundary. Elsewhere — at a dropped bevel
+/// chord, a trimmed spike, or a piece whose validity changed where nothing
+/// cut it — it bridges with a line to the nearest survivor, of whichever
+/// contour, unless its own start is nearer and the loop closes. For a bevel
+/// join that line is the chord itself.
 fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64, width: f64) -> Vec<BezPath> {
     let n = kept.len();
-    let eps = (accuracy * 16.0).max(1e-9);
+    // The match radius. A crossing's two cut points agree to within the
+    // intersection search's accuracy, and this allows for that sixteenfold,
+    // but never past a quarter of the band width: at a coarse tolerance
+    // sixteenfold reached past the band itself (4 against a width of 2), so
+    // the walk handed over to whatever piece of the boundary lay nearby, or
+    // closed on its own start before going round.
+    let eps = (accuracy * 16.0).min(0.25 * width).max(1e-9);
     let max_bridge = MAX_BRIDGE * width;
     let mut used = alloc::vec![false; n];
     let mut loops = Vec::new();
@@ -779,10 +786,9 @@ fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64, width: f64) -> Vec<B
     //
     // Continuations are found through a grid of start points keyed at the
     // match radius, so a query touches only the 3x3 cells that can hold a
-    // match. Bridges use a per-contour set of still-unused pieces, ordered,
-    // so "the next survivor of this contour after `cur`" is a range query.
-    // Both reproduce the old scans exactly, including their preference for
-    // the lowest index among equally valid candidates.
+    // match, preferring the lowest index among valid candidates. Bridges
+    // reach further, through a grid keyed at the band width, searched ring
+    // by ring outwards until no nearer start can remain.
     let cell = eps;
     let key = |p: Point| -> (i64, i64) {
         (
@@ -790,15 +796,57 @@ fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64, width: f64) -> Vec<B
             math::floor(p.y / cell) as i64,
         )
     };
+    let coarse = width.max(eps);
+    let coarse_key = |p: Point| -> (i64, i64) {
+        (
+            math::floor(p.x / coarse) as i64,
+            math::floor(p.y / coarse) as i64,
+        )
+    };
     let mut starts: BTreeMap<(i64, i64), Vec<u32>> = BTreeMap::new();
-    let n_owners = kept.iter().flatten().map(|(o, _)| o + 1).max().unwrap_or(0);
-    let mut free: Vec<BTreeSet<usize>> = alloc::vec![BTreeSet::new(); n_owners];
+    let mut near: BTreeMap<(i64, i64), Vec<u32>> = BTreeMap::new();
     for (i, k) in kept.iter().enumerate() {
-        if let Some((owner, seg)) = k {
+        if let Some((_, seg)) = k {
             starts.entry(key(seg.start())).or_default().push(i as u32);
-            free[*owner].insert(i);
+            near.entry(coarse_key(seg.start()))
+                .or_default()
+                .push(i as u32);
         }
     }
+    let rings = math::ceil(max_bridge / coarse) as i64 + 1;
+    // The unused survivor starting nearest `end`, lowest index among equals,
+    // or nothing within the bridge limit's reach.
+    let nearest = |end: Point, used: &[bool]| -> Option<(f64, usize)> {
+        let (kx, ky) = coarse_key(end);
+        let mut best: Option<(f64, usize)> = None;
+        for r in 0..=rings {
+            // Every start in ring `r` lies at least `(r - 1)` cells away.
+            if best.is_some_and(|(d, _)| d <= (r - 1) as f64 * coarse) {
+                break;
+            }
+            for dy in -r..=r {
+                let step = if dy == -r || dy == r { 1 } else { 2 * r.max(1) };
+                let mut dx = -r;
+                while dx <= r {
+                    // Saturating, as for continuations below.
+                    let cell = (kx.saturating_add(dx), ky.saturating_add(dy));
+                    for &k in near.get(&cell).into_iter().flatten() {
+                        let k = k as usize;
+                        if used[k] {
+                            continue;
+                        }
+                        let Some((_, s)) = kept[k] else { continue };
+                        let d = (s.start() - end).hypot();
+                        if best.is_none_or(|(b, bk)| d < b || (d == b && k < bk)) {
+                            best = Some((d, k));
+                        }
+                    }
+                    dx += step;
+                }
+            }
+        }
+        best
+    };
 
     let mut scan = 0usize;
     loop {
@@ -817,8 +865,7 @@ fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64, width: f64) -> Vec<B
         let mut cur = start;
         loop {
             used[cur] = true;
-            let (owner, seg) = kept[cur].unwrap();
-            free[owner].remove(&cur);
+            let (_, seg) = kept[cur].unwrap();
             split::append_seg(&mut path, seg);
             let end = seg.end();
             if (end - first_pt).hypot() <= eps {
@@ -848,12 +895,11 @@ fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64, width: f64) -> Vec<B
                 }
             }
             if next.is_none() {
-                // Otherwise the next survivor of the same contour, bridged.
-                next = free[owner]
-                    .range(cur + 1..)
-                    .next()
-                    .or_else(|| free[owner].iter().next())
-                    .copied();
+                // Otherwise the nearest survivor, bridged, unless the loop's
+                // own start is nearer.
+                next = nearest(end, &used)
+                    .filter(|&(d, _)| d < (first_pt - end).hypot())
+                    .map(|(_, k)| k);
             }
             let Some(k) = next else { break };
             let s = kept[k].unwrap().1.start();

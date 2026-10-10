@@ -32,11 +32,16 @@ fn dist_to_path(path: &BezPath, p: Point) -> f64 {
 /// deliberately deviate at convex corners — a miter spike reaches past `w`
 /// — so the geometry tests cover those instead.
 fn check(name: &str, path: &BezPath, w: f64, grid: usize) {
+    check_at(name, path, w, grid, TOL);
+}
+
+/// [`check`] at tolerance `tol`.
+fn check_at(name: &str, path: &BezPath, w: f64, grid: usize, tol: f64) {
     for alignment in [StrokeAlignment::Inside, StrokeAlignment::Outside] {
         let style = StrokeStyle::new(w)
             .with_alignment(alignment)
             .with_join(Join::Round);
-        let out = stroke_aligned(path, &style, TOL);
+        let out = stroke_aligned(path, &style, tol);
         assert!(out.is_finite(), "{name}/{alignment:?}: non-finite output");
 
         let bbox = path.bounding_box().inflate(w * 1.6 + 8.0, w * 1.6 + 8.0);
@@ -63,8 +68,8 @@ fn check(name: &str, path: &BezPath, w: f64, grid: usize) {
                 let got = out.winding(p) != 0;
                 assert_eq!(
                     got, want,
-                    "{name}/{alignment:?} w={w} at {p:?}: dist {d:.2}, in_fill {in_fill} \
-                     — expected painted={want}, got {got}"
+                    "{name}/{alignment:?} w={w} tol={tol} at {p:?}: dist {d:.2}, \
+                     in_fill {in_fill} — expected painted={want}, got {got}"
                 );
                 checked += 1;
             }
@@ -83,10 +88,15 @@ fn check(name: &str, path: &BezPath, w: f64, grid: usize) {
 /// report was a circle stroked wider than its diameter, which grew a hole
 /// in the middle.
 fn check_center(name: &str, path: &BezPath, w: f64, grid: usize) {
+    check_center_at(name, path, w, grid, TOL);
+}
+
+/// [`check_center`] at tolerance `tol`.
+fn check_center_at(name: &str, path: &BezPath, w: f64, grid: usize, tol: f64) {
     let style = StrokeStyle::new(w)
         .with_alignment(StrokeAlignment::Center)
         .with_join(Join::Round);
-    let out = stroke_aligned(path, &style, TOL);
+    let out = stroke_aligned(path, &style, tol);
     assert!(out.is_finite(), "{name}/center: non-finite output");
 
     let h = 0.5 * w;
@@ -107,7 +117,8 @@ fn check_center(name: &str, path: &BezPath, w: f64, grid: usize) {
             let got = out.winding(p) != 0;
             assert_eq!(
                 got, want,
-                "{name}/center w={w} at {p:?}: dist {d:.2} — expected painted={want}, got {got}"
+                "{name}/center w={w} tol={tol} at {p:?}: dist {d:.2} — expected \
+                 painted={want}, got {got}"
             );
             checked += 1;
         }
@@ -272,4 +283,137 @@ fn self_intersecting_figure_eight() {
     let f = figure_eight();
     check("figure-eight", &f, 8.0, 64);
     check("figure-eight", &f, 40.0, 56);
+}
+
+/// A square whose closing edge carries a segment far shorter than anything
+/// the pipeline resolves, as a boolean operation leaves where it solved a
+/// crossing; with a square hole, and a second square beside it so the
+/// centered set construction runs across contours.
+fn square_with_sub_resolution_segment() -> BezPath {
+    let mut p = BezPath::new();
+    p.move_to((0.0, 0.0));
+    p.line_to((100.0, 0.0));
+    p.line_to((100.0, 100.0));
+    p.line_to((0.0, 100.0));
+    p.line_to((0.0, 1e-13));
+    p.close_path();
+    p.extend(
+        Rect::new(30.0, 30.0, 70.0, 70.0)
+            .to_path(1e-9)
+            .reverse_subpaths()
+            .iter(),
+    );
+    p.extend(Rect::new(130.0, 0.0, 160.0, 30.0).to_path(1e-9).iter());
+    p
+}
+
+/// A square with a triangular hole whose apex leans right of the edge below
+/// it, which runs straight down: the shape of the counter in Lato's and
+/// Poppins' `4`. No point straight below one of the hole's topmost vertices
+/// lies inside it.
+fn leaning_hole() -> BezPath {
+    let mut p = Rect::new(0.0, 0.0, 100.0, 100.0).to_path(1e-9);
+    let mut hole = BezPath::new();
+    hole.move_to((60.0, 80.0));
+    hole.line_to((60.0, 20.0));
+    hole.line_to((62.0, 10.0));
+    hole.line_to((20.0, 80.0));
+    hole.close_path();
+    if hole.area().signum() == p.area().signum() {
+        hole = hole.reverse_subpaths();
+    }
+    p.extend(hole.iter());
+    p
+}
+
+/// Inter's `$` at 256 px, its overlapping S and bar merged into one outline
+/// and two holes by `linesweeper` 0.5, as Voyager merges a text's contours
+/// before stroking it (reported 2026-10-11). The bar is narrower than twice
+/// the width checked, and the merge leaves segments around `1e-13` long
+/// where the bar meets the S.
+const MERGED_DOLLAR: &str = concat!(
+    "M76.25,40.814558236183629 L76.25,15.625 L91.25,15.625 ",
+    "L91.250000000001478,40.547558813597533 ",
+    "C101.11762911921608,41.138567222814572 109.99262911921551,43.247714284948728 117.875,46.875 ",
+    "C127.29166666666663,51.208333333333329 134.72916666666663,57.104166666666671 140.1875,64.5625 ",
+    "C145.64583333333326,72.020833333333329 148.54166666666674,80.458333333333329 148.875,89.875 ",
+    "L125.625,89.875 ",
+    "C124.54166666666663,80.791666666666671 120.20833333333337,73.770833333333329 112.625,68.8125 ",
+    "C106.60341596006481,64.875310435427025 99.478415963578527,62.501293475968239 91.250000010541044,61.690449121623629 ",
+    "L91.25,124.84563758389262 L98.625,126.875 ",
+    "C103.625,128.20833333333334 109.14583333333337,130.04166666666666 115.1875,132.375 ",
+    "C121.22916666666663,134.70833333333334 127,137.8125 132.5,141.6875 ",
+    "C138,145.5625 142.52083333333326,150.47916666666666 146.0625,156.4375 ",
+    "C149.60416666666674,162.39583333333334 151.375,169.70833333333334 151.375,178.375 ",
+    "C151.375,188.54166666666666 148.72916666666674,197.70833333333334 143.4375,205.875 ",
+    "C138.14583333333326,214.04166666666666 130.45833333333337,220.5 120.375,225.25 ",
+    "C112.09838184050056,229.14890276935097 102.3900488461951,231.44765366450693 91.250001017083491,232.14625268546786 ",
+    "L91.25,256.375 L76.25,256.375 L76.25,232.13747994526159 ",
+    "L76.249999999999659,232.13747994526159 ",
+    "C65.945643797751245,231.46747343449425 56.799810464417988,229.37998011940704 48.8125,225.875 ",
+    "C38.9375,221.54166666666666 31.208333333333371,215.47916666666666 25.625,207.6875 ",
+    "C20.041666666666629,199.89583333333334 16.875,190.79166666666666 16.125,180.375 ",
+    "L40.5,180.375 ",
+    "C41.166666666666629,187.375 43.541666666666629,193.14583333333334 47.625,197.6875 ",
+    "C51.708333333333371,202.22916666666666 56.9375,205.60416666666666 63.3125,207.8125 ",
+    "C67.441472301617978,209.24279759467814 71.75397230161775,210.20990623629768 76.249999999999204,210.71382592485867 ",
+    "L76.25,210.71382592485867 L76.25,143.46458333333334 L68.875,141.375 ",
+    "C53.875,137.125 42.208333333333371,131.04166666666666 33.875,123.125 ",
+    "C25.541666666666629,115.20833333333334 21.375,105.08333333333333 21.375,92.75 ",
+    "C21.375,82.25 24.208333333333371,73.0625 29.875,65.1875 ",
+    "C35.541666666666629,57.3125 43.208333333333371,51.208333333333329 52.875,46.875 ",
+    "C60.027880824825729,43.668536181974673 67.819547491492926,41.648388927369211 76.250000000001592,40.814558236183629 ",
+    "L76.25,40.814558236183629 Z M76.25,61.900408726538899 ",
+    "C71.626369999137523,62.509023759797358 67.397203332470895,63.646387517617725 63.5625,65.3125 ",
+    "C57.520833333333371,67.9375 52.833333333333371,71.520833333333329 49.5,76.0625 ",
+    "C46.166666666666629,80.604166666666671 44.5,85.791666666666671 44.5,91.625 ",
+    "C44.5,98.125 46.520833333333371,103.35416666666667 50.5625,107.3125 ",
+    "C54.604166666666629,111.27083333333334 59.395833333333371,114.35416666666666 64.9375,116.5625 ",
+    "C68.986357809295896,118.17595461573447 72.757191147566573,119.53362671812556 76.25000001481169,120.63551630717319 ",
+    "L76.25,61.900408726538899 Z M91.25,147.71458333333334 L91.25,210.73731712447102 ",
+    "L91.250000000000568,210.73731712447102 ",
+    "C96.723224689003359,210.15271132218885 101.78572468900325,208.90693894736515 106.4375,207 ",
+    "C113.14583333333337,204.25 118.45833333333337,200.375 122.375,195.375 ",
+    "C126.29166666666663,190.375 128.25,184.58333333333334 128.25,178 ",
+    "C128.25,172 126.5625,167.125 123.1875,163.375 ",
+    "C119.8125,159.625 115.33333333333337,156.54166666666666 109.75,154.125 ",
+    "C104.16666666666663,151.70833333333334 98.041666666666629,149.58333333333334 91.375,147.75 ",
+    "L91.25,147.71458333333334 Z",
+);
+
+/// A segment shorter than the pipeline resolves is noise, not geometry. Its
+/// two ends used to read as the contour revisiting a vertex, so a simple
+/// contour was split into lobes there, and the centered construction left
+/// it out of the fill the hole was judged against: the hole lost its band.
+#[test]
+fn a_sub_resolution_segment_does_not_split_a_contour() {
+    let p = square_with_sub_resolution_segment();
+    check("sub-resolution", &p, 8.0, 64);
+    check_center("sub-resolution", &p, 8.0, 64);
+}
+
+/// The fill probe looks just below a hole's topmost points. When none of
+/// them works it used to fall back to the hole's own signed area, which
+/// takes a hole for a filled region: the inside stroke painted the whole
+/// hole and the centered stroke left its edge bare.
+#[test]
+fn a_hole_whose_apex_leans_is_still_a_hole() {
+    let p = leaning_hole();
+    check("leaning-hole", &p, 4.0, 72);
+    check_center("leaning-hole", &p, 4.0, 72);
+}
+
+/// Where the bar crosses the S, the bands either side of it meet across a
+/// gap of twice the width less the bar's. At fine tolerances the stitcher's
+/// match radius fell below that gap, the walk dead-ended and closed with a
+/// chord down the bar; at coarse ones the radius outgrew the band and the
+/// walk handed over to unrelated pieces. Both painted the fill through the
+/// inside stroke.
+#[test]
+fn a_bar_narrower_than_the_band_keeps_its_crossings() {
+    let p = BezPath::from_svg(MERGED_DOLLAR).expect("valid path data");
+    for tol in [1.0 / 16.0, 0.25, 1.0] {
+        check_at("merged-dollar", &p, 8.0, 96, tol);
+        check_center_at("merged-dollar", &p, 8.0, 96, tol);
+    }
 }

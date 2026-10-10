@@ -148,13 +148,11 @@ pub(crate) fn split_self_intersections(
     // pixels than for the same shape in a 0..1 coordinate system: too loose
     // at small scales, where it merges genuinely distinct vertices, and too
     // tight at large ones. Exactly coincident anchors — what real path data
-    // carries — match under any radius.
-    let extent = {
-        let bb = kurbo::BezPath::from_vec(subpath.to_vec()).control_box();
-        bb.size().max_side()
-    };
+    // carries — match under any radius. The radius is the one
+    // canonicalization drops segments under, so the two ends of a segment
+    // the input carried never read as a revisit.
     let vtx_eps2 = {
-        let e = 1e-9 * extent;
+        let e = crate::normalize::RESOLUTION * crate::normalize::extent(subpath);
         (e * e).max(f64::MIN_POSITIVE)
     };
     let vertex_after: Vec<Point> = segs.iter().map(|s| s.end()).collect();

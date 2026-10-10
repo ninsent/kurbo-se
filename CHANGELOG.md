@@ -2,6 +2,63 @@
 
 This changelog follows <https://keepachangelog.com/en/>.
 
+## 0.1.2 (2026-10-11)
+
+### Fixed
+
+- Tiny segments no longer split a contour in two. Boolean operations often
+  leave segments around `1e-13` long where two outlines met, and the
+  self-intersection check saw their two ends as the same point, so it
+  treated a simple contour as one that crosses itself. In practice a
+  merged glyph like `$` lost the centered stroke around one of its holes,
+  and inside strokes showed thin slivers. These segments are now dropped
+  when the path is first read, using the same distance the
+  self-intersection check uses.
+- Holes with a slanted top are recognized as holes again. To decide which
+  side of a contour is filled, the stroker probes a point just below its
+  highest corners. For a hole whose top corner leans to one side, with a
+  straight vertical edge under the next corner, every probe missed and the
+  stroker assumed the hole was filled. The counter of the `4` in Lato and
+  Poppins got painted solid by an inside stroke, and a centered stroke
+  skipped its edge. When the usual probe misses, it now tries a point just
+  beside the middle of an edge.
+- Inside and outside strokes no longer draw long straight lines across a
+  shape. After trimming, the stroker joins the remaining pieces back into
+  loops, connecting a piece to whichever one starts within a small radius.
+  That radius grew with the tolerance, so at coarse settings it was wider
+  than the stroke itself and pieces got connected to the wrong neighbours.
+  At fine settings it was too small to bridge a real gap, such as where
+  the `$` bar crosses the S, and the loop was closed with a straight line
+  down the bar. The radius is now capped at a quarter of the stroke width,
+  and when nothing is close enough, the loop continues to the nearest
+  remaining piece. That lookup goes through a grid, so it stays fast.
+
+To check these on real text, every Latin letter, digit and some symbols
+from 56 font files were set in lines, merged and stroked at width 2 with
+round joins, then compared point by point against what the stroke should
+cover. At tolerances 0.25, 0.0625 and 0.0156, the wrong points dropped
+from 2.4M, 0.8M and 0.7M to 91k, 14k and 1.8k. Before, every font had at
+least one line with noticeable errors; now 28 do. A few cases got worse:
+64 out of 1887, and only 15 by a visible amount, mostly at the coarsest
+tolerance. In those the loop still continues to the wrong nearby piece,
+for example `æ` in Lato SemiBold Italic, `À` and `!` in Instrument Sans,
+and `cdg` in Poppins Bold Italic.
+
+### Changed
+
+- Performance is within 2% of 0.1.1. The one exception is the 10-point
+  star, which went from 7.19 to 7.41 µs because of the extra pass over the
+  input. For comparison, kurbo's own stroke benchmark moved by −0.9% in the
+  same run.
+
+### Added
+
+- Tests for each of the three fixes: a square with a tiny segment on its
+  closing edge, a hole with a slanted top, and Inter's `$` with its S and
+  bar merged by `linesweeper`, checked at three tolerances. The `check`
+  and `check_center` helpers gained `check_at` and `check_center_at`,
+  which take a tolerance.
+
 ## 0.1.1 (2026-08-22)
 
 ### Fixed

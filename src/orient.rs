@@ -17,7 +17,9 @@
 //! disk is filled there. Holes then stroke into the ring, and reversing
 //! winding directions changes nothing.
 
-use kurbo::{BezPath, ParamCurve, ParamCurveExtrema, PathEl, Point, Shape, Vec2};
+use kurbo::{
+    BezPath, ParamCurve, ParamCurveDeriv, ParamCurveExtrema, PathEl, PathSeg, Point, Shape, Vec2,
+};
 
 use crate::style::{StrokeAlignment, StrokeSide};
 
@@ -122,7 +124,9 @@ pub(crate) fn fill_side(subpath: &[PathEl], whole: &BezPath, probe_scale: f64) -
     let delta = 1e-6 * probe_scale;
     if delta > 0.0 {
         for delta in [delta, delta / 1024.0] {
-            if let Some(p_in) = probe_point(subpath, delta) {
+            let probe = probe_point(subpath, delta)
+                .or_else(|| probe_beside(subpath, delta, own_disk_right));
+            if let Some(p_in) = probe {
                 let filled = whole.winding(p_in) != 0;
                 return if filled {
                     own_disk
@@ -176,6 +180,36 @@ fn probe_point(subpath: &[PathEl], delta: f64) -> Option<Point> {
     candidates.sort_by(|a, b| a.y.total_cmp(&b.y));
     for c in candidates.iter() {
         let p_in = *c + Vec2::new(0.0, delta);
+        if subpath.winding(p_in) != 0 {
+            return Some(p_in);
+        }
+    }
+    None
+}
+
+/// A point verified to lie inside the subpath's own disk, `delta` off the
+/// middle of one of its segments, on the side the own disk lies.
+///
+/// The fallback for a subpath whose topmost points all fail [`probe_point`]:
+/// an apex that leans, so its interior lies beside it rather than below, and
+/// a vertical edge running down from the next one, so the point below lies on
+/// the subpath itself. A segment's middle is no corner, so the own disk lies
+/// just off it to one side. Without this, such a hole fell back to the
+/// own-disk rule and was stroked as if it were filled.
+fn probe_beside(subpath: &[PathEl], delta: f64, own_disk_right: bool) -> Option<Point> {
+    for seg in kurbo::segments(subpath.iter().copied()) {
+        let tangent = match seg {
+            PathSeg::Line(line) => line.p1 - line.p0,
+            PathSeg::Quad(quad) => quad.deriv().eval(0.5).to_vec2(),
+            PathSeg::Cubic(cubic) => cubic.deriv().eval(0.5).to_vec2(),
+        };
+        let length = tangent.hypot();
+        if length == 0.0 || !length.is_finite() {
+            continue;
+        }
+        let right = tangent.turn_90() / length;
+        let toward_disk = if own_disk_right { right } else { -right };
+        let p_in = seg.eval(0.5) + toward_disk * delta;
         if subpath.winding(p_in) != 0 {
             return Some(p_in);
         }

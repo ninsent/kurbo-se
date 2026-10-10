@@ -25,7 +25,10 @@ use crate::math;
 ///   and a `NaN` arc length upstream, so every stage would have to skip
 ///   them anyway; dropping them here, once, protects all of them. The next
 ///   element re-anchors at the previous on-curve point, which moves it by
-///   less than the pipeline can resolve.
+///   less than the pipeline can resolve;
+/// - no drawing element stays within [`RESOLUTION`] of the point it starts
+///   from, and a subpath that ends that near its start closes exactly onto
+///   it. See [`drop_sub_resolution`].
 pub(crate) fn collect_canonical(elements: impl Iterator<Item = PathEl>, out: &mut BezPath) {
     out.truncate(0);
     // Start point of the current subpath, used both for the implicit `MoveTo`
@@ -91,6 +94,90 @@ pub(crate) fn collect_canonical(elements: impl Iterator<Item = PathEl>, out: &mu
                 last = el.end_point().unwrap_or(last);
             }
         }
+    }
+    drop_sub_resolution(out);
+}
+
+/// Below this fraction of a subpath's own extent, two points are one point
+/// to the pipeline: `split` reads anchors this close as the path revisiting
+/// itself.
+pub(crate) const RESOLUTION: f64 = 1e-9;
+
+/// The largest side of a subpath's control box: the extent [`RESOLUTION`]
+/// is a fraction of.
+pub(crate) fn extent(subpath: &[PathEl]) -> f64 {
+    let mut points = subpath.iter().flat_map(|el| match *el {
+        PathEl::MoveTo(p) | PathEl::LineTo(p) => [Some(p), None, None],
+        PathEl::QuadTo(p1, p2) => [Some(p1), Some(p2), None],
+        PathEl::CurveTo(p1, p2, p3) => [Some(p1), Some(p2), Some(p3)],
+        PathEl::ClosePath => [None, None, None],
+    });
+    let Some(Some(first)) = points.next() else {
+        return 0.0;
+    };
+    let bounds = points
+        .flatten()
+        .fold(kurbo::Rect::from_points(first, first), |r, p| r.union_pt(p));
+    bounds.size().max_side()
+}
+
+/// Drop every drawing element that stays within [`RESOLUTION`] of the point
+/// it starts from, and close a subpath that ends that near its start exactly
+/// onto it.
+///
+/// Such a segment is noise rather than geometry, typically left where a
+/// boolean operation solved a crossing. Its direction is arbitrary, and its
+/// two ends read as the path revisiting a vertex, so `split` would cut a
+/// simple contour into lobes there. Like a degenerate segment it is dropped
+/// once, here, and the next element re-anchors at the previous on-curve
+/// point. The path is only rebuilt when it carries one.
+fn drop_sub_resolution(out: &mut BezPath) {
+    let found = subpaths(out.elements()).any(|subpath| {
+        let eps = RESOLUTION * extent(subpath);
+        let start = start_point(subpath);
+        let mut last = start;
+        subpath.iter().any(|&el| {
+            let unresolved = stays_within(el, last, eps)
+                || (el == PathEl::ClosePath && last != start && (last - start).hypot() <= eps);
+            last = el.end_point().unwrap_or(start);
+            unresolved
+        })
+    });
+    if !found {
+        return;
+    }
+    let mut kept = BezPath::new();
+    for subpath in subpaths(out.elements()) {
+        let eps = RESOLUTION * extent(subpath);
+        let start = start_point(subpath);
+        let mut last = start;
+        for &el in subpath {
+            if stays_within(el, last, eps) {
+                continue;
+            }
+            if el == PathEl::ClosePath && last != start && (last - start).hypot() <= eps {
+                if let Some(
+                    PathEl::LineTo(end) | PathEl::QuadTo(_, end) | PathEl::CurveTo(_, _, end),
+                ) = kept.elements_mut().last_mut()
+                {
+                    *end = start;
+                }
+            }
+            kept.push(el);
+            last = el.end_point().unwrap_or(start);
+        }
+    }
+    *out = kept;
+}
+
+/// Whether drawing element `el`, starting at `from`, stays within `eps` of it.
+fn stays_within(el: PathEl, from: Point, eps: f64) -> bool {
+    let near = |p: Point| (p - from).hypot() <= eps;
+    match el {
+        PathEl::LineTo(p) => near(p),
+        PathEl::QuadTo(p1, p2) => near(p1) && near(p2),
+        PathEl::CurveTo(p1, p2, p3) => near(p1) && near(p2) && near(p3),
+        PathEl::MoveTo(_) | PathEl::ClosePath => false,
     }
 }
 
