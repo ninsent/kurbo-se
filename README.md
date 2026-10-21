@@ -67,6 +67,13 @@ Width profiles are out of scope.
   minus the fill eroded by `w/2`. Past the local thickness the band
   saturates instead of the inverted inner boundary punching a hole. A
   circle stroked wider than its diameter stays a solid disc.
+- Joins: the definitions above describe round joins. Miter and bevel
+  joins differ only near corners. A miter reaches past `w` into a corner,
+  and a bevel cuts across it. So with bevel joins the band reaches less
+  far into a concave corner, and a shape whose middle lies beyond its
+  concave corners saturates at a larger width. For a star whose inner
+  corners turn by 70°, bevel joins need about 1.22 times the width that
+  round joins need.
 - Self-intersecting contours (bowtie, figure-eight) are split at their
   crossings. Each lobe resolves against the fill on its own.
 - Open subpaths: inside/outside is geometrically undefined there. kurbo-se
@@ -91,7 +98,7 @@ Measured on an Apple-silicon laptop at tolerance 0.25 (criterion, release):
 
 | Case | time |
 |---|---|
-| 10-point star (lines), inside, solid | 7.0 µs |
+| 10-point star (lines), inside, solid | 9.3 µs |
 | circle (62 segs), center, solid | 50 µs (kurbo's native stroker: 12.9 µs) |
 | circle (62 segs), inside, solid | 32 µs |
 | circle, inside, dashed + round dash caps | 55 µs |

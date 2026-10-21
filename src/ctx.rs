@@ -444,7 +444,7 @@ pub fn stroke_aligned_with<'a>(
                 piece.closed,
                 d,
                 params,
-                0.0,
+                dash::Phase::default(),
                 piece.true_start,
                 piece.true_end,
                 clip,
@@ -465,7 +465,11 @@ pub fn stroke_aligned_with<'a>(
                         false,
                         d,
                         params,
-                        arc.s0,
+                        dash::Phase {
+                            s0: arc.s0,
+                            seam: arc.seam,
+                            shares_end: arc.shares_end,
+                        },
                         piece.true_start,
                         piece.true_end,
                         clip,
@@ -541,11 +545,14 @@ fn region_setup<'a>(
             fill_side: StrokeSide::Right,
         })
         .collect();
-    let mut region_source = BezPath::new();
-    for els in normalized {
-        region_source.extend(els.iter());
-    }
-    let index = crate::region::SourceIndex::new(&region_source, (w * 1e-3).max(tolerance * 0.1));
+    let index = crate::region::SourceIndex::with_joins(
+        normalized,
+        (w * 1e-3).max(tolerance * 0.1),
+        style.join,
+        miter_limit,
+        join_thresh,
+        w,
+    );
     let base = BandParams {
         d_left: 0.0,
         d_right: 0.0,

@@ -18,7 +18,8 @@
 //! winding directions changes nothing.
 
 use kurbo::{
-    BezPath, ParamCurve, ParamCurveDeriv, ParamCurveExtrema, PathEl, PathSeg, Point, Shape, Vec2,
+    Affine, BezPath, ParamCurve, ParamCurveDeriv, ParamCurveExtrema, ParamCurveNearest, PathEl,
+    PathSeg, Point, Shape, Vec2,
 };
 
 use crate::style::{StrokeAlignment, StrokeSide};
@@ -125,9 +126,10 @@ pub(crate) fn fill_side(subpath: &[PathEl], whole: &BezPath, probe_scale: f64) -
     if delta > 0.0 {
         for delta in [delta, delta / 1024.0] {
             let probe = probe_point(subpath, delta)
+                .map(|p| (p, Ray::Up))
                 .or_else(|| probe_beside(subpath, delta, own_disk_right));
-            if let Some(p_in) = probe {
-                let filled = whole.winding(p_in) != 0;
+            if let Some((p_in, ray)) = probe {
+                let filled = ray.winding(whole.elements(), p_in) != 0;
                 return if filled {
                     own_disk
                 } else {
@@ -141,13 +143,65 @@ pub(crate) fn fill_side(subpath: &[PathEl], whole: &BezPath, probe_scale: f64) -
     own_disk
 }
 
+/// Which way a probe's winding is counted.
+///
+/// Just below the highest point of a curve, a ray to the left grazes it.
+/// Its two crossings nearly coincide, and rounding decides them. kurbo
+/// solves each curve for the ray's height and can lose them there: the
+/// figure-eight in `tests/degenerate.rs`, scaled by 1e-3, read the top of
+/// its left loop as unfilled. [`winding`] finds crossings by bisection,
+/// which cannot lose them. On top of that, a probe is counted along a ray
+/// that crosses the curve it sits by: upwards below a top, and sideways
+/// beside a steep curve. So no count has to resolve a graze.
+#[derive(Copy, Clone)]
+enum Ray {
+    Left,
+    Up,
+}
+
+impl Ray {
+    /// The winding number of `els` at `p`, counted along this ray.
+    fn winding(self, els: &[PathEl], p: Point) -> i32 {
+        match self {
+            Ray::Left => winding(els, p),
+            Ray::Up => {
+                // Swapping the axes turns the leftward ray upwards. The swap
+                // is exact, and a mirror only flips the winding's sign.
+                // Open subpaths are closed first, as filling closes them.
+                // Left open, the count would depend on the ray's direction:
+                // a leftward ray never reaches an open polyline lying above
+                // the probe, but an upward ray can.
+                let swap = Affine::new([0.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
+                let mut swapped = BezPath::new();
+                let mut open = false;
+                for &el in els {
+                    match el {
+                        PathEl::MoveTo(_) if open => swapped.close_path(),
+                        PathEl::ClosePath => open = false,
+                        _ => open = true,
+                    }
+                    if matches!(el, PathEl::MoveTo(_)) {
+                        open = false;
+                    }
+                    swapped.push(swap * el);
+                }
+                if open {
+                    swapped.close_path();
+                }
+                winding(swapped.elements(), swap * p)
+            }
+        }
+    }
+}
+
 /// A point verified to lie inside the subpath's own disk.
 ///
 /// The candidates are the topmost points of the subpath: curve extrema and
 /// segment endpoints, ascending in y. At a topmost point the interior lies
 /// locally below, so `candidate + (0, δ)` is inside. Each candidate is
 /// checked against the subpath's own winding, which is what makes this
-/// survive corners, flat tops, and spikes thinner than δ.
+/// survive corners, flat tops, and spikes thinner than δ. The point must
+/// also keep clear of the subpath, as [`is_clear`] checks.
 fn probe_point(subpath: &[PathEl], delta: f64) -> Option<Point> {
     let mut candidates: [Point; MAX_PROBE_CANDIDATES] = [Point::ORIGIN; MAX_PROBE_CANDIDATES];
     let mut n = 0;
@@ -172,15 +226,21 @@ fn probe_point(subpath: &[PathEl], delta: f64) -> Option<Point> {
     for seg in kurbo::segments(subpath.iter().copied()) {
         consider(seg.eval(0.0));
         consider(seg.eval(1.0));
+        // Only the extrema in `y`. At an extremum in `x` the curve is
+        // vertical, so the point below it lies on the curve to within
+        // rounding, and any winding taken there is noise.
         for t in seg.extrema() {
-            consider(seg.eval(t));
+            let d = crate::split::deriv(&seg, t);
+            if d.y.abs() <= d.x.abs() {
+                consider(seg.eval(t));
+            }
         }
     }
     let candidates = &mut candidates[..n];
     candidates.sort_by(|a, b| a.y.total_cmp(&b.y));
     for c in candidates.iter() {
         let p_in = *c + Vec2::new(0.0, delta);
-        if subpath.winding(p_in) != 0 {
+        if Ray::Up.winding(subpath, p_in) != 0 && is_clear(subpath, p_in, delta) {
             return Some(p_in);
         }
     }
@@ -196,7 +256,7 @@ fn probe_point(subpath: &[PathEl], delta: f64) -> Option<Point> {
 /// the subpath itself. A segment's middle is no corner, so the own disk lies
 /// just off it to one side. Without this, such a hole fell back to the
 /// own-disk rule and was stroked as if it were filled.
-fn probe_beside(subpath: &[PathEl], delta: f64, own_disk_right: bool) -> Option<Point> {
+fn probe_beside(subpath: &[PathEl], delta: f64, own_disk_right: bool) -> Option<(Point, Ray)> {
     for seg in kurbo::segments(subpath.iter().copied()) {
         let tangent = match seg {
             PathSeg::Line(line) => line.p1 - line.p0,
@@ -210,11 +270,134 @@ fn probe_beside(subpath: &[PathEl], delta: f64, own_disk_right: bool) -> Option<
         let right = tangent.turn_90() / length;
         let toward_disk = if own_disk_right { right } else { -right };
         let p_in = seg.eval(0.5) + toward_disk * delta;
-        if subpath.winding(p_in) != 0 {
-            return Some(p_in);
+        let ray = if tangent.y.abs() < tangent.x.abs() {
+            Ray::Up
+        } else {
+            Ray::Left
+        };
+        if ray.winding(subpath, p_in) != 0 && is_clear(subpath, p_in, delta) {
+            return Some((p_in, ray));
         }
     }
     None
+}
+
+/// Whether `p_in`, a probe `delta` off the subpath, stays more than a
+/// sixteenth of that distance away from all of it.
+///
+/// A probe δ below a point where the curve runs vertically lies only about
+/// δ² from the curve. At the finer δ that is rounding, so the subpath's
+/// winding at the probe is noise. A lobe is a subsegment of the path it
+/// was cut from, so the two outlines differ by the same rounding, and the
+/// whole path can read the probe the other way. In the loop of
+/// `M20,150 C200,20 0,20 180,150`, the probe below the lobe's leftmost
+/// point read inside the lobe but outside the path, and the lobe got the
+/// wrong fill side.
+fn is_clear(subpath: &[PathEl], p_in: Point, delta: f64) -> bool {
+    let margin = delta / 16.0;
+    kurbo::segments(subpath.iter().copied()).all(|seg| {
+        !crate::clip::control_box(&seg)
+            .inflate(margin, margin)
+            .contains(p_in)
+            || seg.nearest(p_in, 1e-9).distance_sq > margin * margin
+    })
+}
+
+/// The winding number of `els` around `p`. This is kurbo's
+/// `Shape::winding`, except that curve crossings are found by bisection.
+///
+/// Both count crossings of a ray pointing left, one monotonic piece of a
+/// segment at a time. kurbo 0.13.1 finds where a cubic piece meets the ray
+/// by solving the cubic in closed form. On either side of a loop's apex the
+/// pieces are nearly quadratic, so their leading coefficient is rounding
+/// noise and the solver loses the real root. A point 2e-4 below the top of
+/// the loop in `M20,150 C200,20 0,20 180,150` read as outside it. A piece
+/// is monotonic, so bisecting its parameter always finds the crossing.
+pub(crate) fn winding(els: &[PathEl], p: Point) -> i32 {
+    kurbo::segments(els.iter().copied())
+        .map(|seg| segment_winding(&seg, p))
+        .sum()
+}
+
+fn segment_winding(seg: &PathSeg, p: Point) -> i32 {
+    let bounds = crate::clip::control_box(seg);
+    if p.y < bounds.y0 || p.y > bounds.y1 || p.x < bounds.x0 {
+        return 0;
+    }
+    let mut winding = 0;
+    let mut piece_start = (0.0, seg.start());
+    for t in seg.extrema().into_iter().chain([1.0]) {
+        let piece_end = (t, if t == 1.0 { seg.end() } else { seg.eval(t) });
+        winding += piece_winding(seg, piece_start, piece_end, p);
+        piece_start = piece_end;
+    }
+    winding
+}
+
+/// How one monotonic piece of `seg` crosses the leftward ray from `p`:
+/// `1` or `-1` by direction, or `0` if it does not. The piece runs from
+/// parameter `t0` at `start` to `t1` at `end`. As in kurbo, a piece
+/// includes its end with the smaller `y` but not the other, so a vertex
+/// shared by two pieces counts once.
+fn piece_winding(
+    seg: &PathSeg,
+    (t0, start): (f64, Point),
+    (t1, end): (f64, Point),
+    p: Point,
+) -> i32 {
+    let sign = if end.y > start.y {
+        if p.y < start.y || p.y >= end.y {
+            return 0;
+        }
+        -1
+    } else if end.y < start.y {
+        if p.y < end.y || p.y >= start.y {
+            return 0;
+        }
+        1
+    } else {
+        return 0;
+    };
+    // `extrema` cuts at x extrema too, so the piece lies between its ends in x.
+    if p.x < start.x.min(end.x) {
+        return 0;
+    }
+    if p.x >= start.x.max(end.x) {
+        return sign;
+    }
+    if let PathSeg::Line(_) = seg {
+        // kurbo's side-of-line test, which needs no solve.
+        let a = end.y - start.y;
+        let b = start.x - end.x;
+        let c = a * start.x + b * start.y;
+        return if (a * p.x + b * p.y - c) * f64::from(sign) <= 0.0 {
+            sign
+        } else {
+            0
+        };
+    }
+    // The crossing stays between `lo` and `hi`. The piece is monotonic in x,
+    // so the answer is known once both their x values lie on one side of `p`.
+    let below_at_start = start.y <= p.y;
+    let (mut lo, mut hi) = ((t0, start), (t1, end));
+    loop {
+        if p.x < lo.1.x.min(hi.1.x) {
+            return 0;
+        }
+        if p.x >= lo.1.x.max(hi.1.x) {
+            return sign;
+        }
+        let t = 0.5 * (lo.0 + hi.0);
+        if t <= lo.0 || t >= hi.0 {
+            return if p.x >= lo.1.x { sign } else { 0 };
+        }
+        let mid = (t, seg.eval(t));
+        if (mid.1.y <= p.y) == below_at_start {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
 }
 
 /// Split a width across the two band sides according to the resolved side.
@@ -353,5 +536,28 @@ mod tests {
             ),
             StrokeSide::Left
         );
+    }
+
+    /// The loop of `M20,150 C200,20 0,20 180,150`, cut off as a lobe, is a
+    /// counter-clockwise teardrop. The whole path fills its disk, so the
+    /// lobe's fill side must face the disk. kurbo's winding misses the
+    /// crossing 2e-4 below the apex, so the probe fell through to a point
+    /// below the lobe's leftmost point. That point is within rounding of the
+    /// curve, where the lobe and the whole path disagree.
+    #[test]
+    fn loop_lobe_faces_its_filled_disk() {
+        let mut whole = BezPath::new();
+        whole.move_to((20.0, 150.0));
+        whole.curve_to((200.0, 20.0), (0.0, 20.0), (180.0, 150.0));
+        let scale = whole.control_box().size().max_side();
+        for accuracy in [0.25, 1e-3] {
+            let split =
+                crate::split::split_self_intersections(whole.elements(), false, accuracy).unwrap();
+            let lobe = split.pieces.iter().find(|p| p.closed).unwrap();
+            let lobe = lobe.els.elements();
+            assert!(lobe.area() < 0.0, "disk on the left");
+            assert_eq!(winding(lobe, Point::new(100.0, 52.5 + 2e-4)), -1);
+            assert_eq!(fill_side(lobe, &whole, scale), StrokeSide::Left);
+        }
     }
 }

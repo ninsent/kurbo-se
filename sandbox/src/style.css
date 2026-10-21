@@ -88,7 +88,8 @@ body {
   width: 60px;
   text-align: right;
 }
-.row input.pattern {
+.row input.pattern,
+.row input.text {
   flex: 1;
   min-width: 0;
 }
@@ -99,6 +100,7 @@ body {
 
 input[type="number"],
 input.pattern,
+input.text,
 select {
   background: var(--field);
   color: var(--text);
@@ -110,6 +112,7 @@ select {
 }
 input[type="number"]:focus-visible,
 input.pattern:focus-visible,
+input.text:focus-visible,
 select:focus-visible {
   border-color: var(--accent);
 }
@@ -134,6 +137,36 @@ input[type="color"]::-webkit-color-swatch {
   color: var(--faint);
   font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
   text-transform: uppercase;
+}
+/* Character counter for the text source. Turns red at the limit. */
+.count {
+  min-width: 36px;
+  text-align: right;
+}
+.count.full {
+  color: var(--danger);
+}
+.row[hidden] {
+  display: none;
+}
+.hint {
+  color: var(--faint);
+  font-size: 12px;
+}
+/* Explanatory text under a control. */
+.note {
+  margin: 4px 0 8px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-soft);
+  border-radius: 8px;
+  background: var(--field);
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.note b {
+  color: var(--text);
+  font-weight: 600;
 }
 
 .seg {

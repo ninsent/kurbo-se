@@ -12,6 +12,11 @@ kurbo-se = { path = "../.." }
 wasm-bindgen = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Text source: parley lays the text out, skrifa draws the glyph outlines.
+# Wasm has no system fonts, so the bundled Inter is the only font and
+# fontique's `system` feature stays off.
+parley = { version = "0.12", default-features = false, features = ["std"] }
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
 
 [profile.release]
 opt-level = "s"

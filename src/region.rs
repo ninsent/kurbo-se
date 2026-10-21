@@ -19,25 +19,31 @@
 //!
 //! Those are not the naive offset curves: past the local thickness the
 //! offset self-intersects and inverts. They are computed the classical way.
-//! Take the raw offset of every contour, cut it at every intersection with
-//! itself and with the others, then discard each piece that is nearer than
-//! `w` to the path, on the wrong side of the fill, or inside another loop's
-//! region, and stitch what survives. That last test is a winding test
-//! against the raw loops themselves, which miter and bevel joins require —
-//! their loops deviate from the distance-`w` set at corners. Cutting across
-//! contours is what makes overlapping bands merge into one boundary instead
-//! of two overlapping ones, which nonzero winding could not express.
+//! Take the raw offset of every contour and cut it at every intersection
+//! with itself and with the others. Then discard each piece that lies
+//! inside the band of width `w`, on the wrong side of the fill, inside
+//! another loop's region, or on the band side of a strand it crosses, and
+//! stitch what survives.
+//!
+//! The distance test uses the real shape of the joins, so a bevel or miter
+//! corner is not mistaken for a round one; see `Corner`. The region test
+//! is a winding test against the raw loops themselves, which miter and
+//! bevel joins require: their loops deviate from the distance-`w` set at
+//! corners. The crossing test catches strands that cross too shallowly for
+//! the distance test's slack, as near the collapse of an erosion. Cutting
+//! across contours is what makes overlapping bands merge into one boundary
+//! instead of two overlapping ones, which nonzero winding could not
+//! express.
 //!
 //! When nothing survives, the erosion is empty and the stroke saturates:
 //! the shape fills completely, as Figma renders a wedge, a thin star, or a
 //! rectangle narrower than `2w`. Dropped pieces whose neighbours survive
-//! are rejoined with a straight line, which reproduces bevel-join chords
-//! exactly.
+//! are rejoined with a straight line.
 
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 
-use kurbo::{BezPath, ParamCurve, PathEl, PathSeg, Point, Rect, Shape};
+use kurbo::{BezPath, Join, ParamCurve, PathEl, PathSeg, Point, Rect, Shape, Vec2};
 
 use crate::expand::{Band, BandParams};
 use crate::math;
@@ -72,10 +78,23 @@ pub(crate) struct ContourSpec<'a> {
 /// filter, so each wrapper can scope a query to one tag or away from it.
 struct EdgeIndex {
     edges: Vec<(Point, Point, u32, bool)>,
+    /// Per edge, which of its ends are corners of the source contour and
+    /// on which side each corner's join lies, as bits like [`FILL_START`].
+    /// Empty means no edge has a corner.
+    ends: Vec<u8>,
     buckets: Vec<Vec<u32>>,
     y0: f64,
     inv_h: f64,
 }
+
+/// The edge's start point is a corner whose join lies on the fill side.
+const FILL_START: u8 = 1;
+/// The edge's end point is a corner whose join lies on the fill side.
+const FILL_END: u8 = 2;
+/// The edge's start point is a corner whose join lies away from the fill.
+const OUT_START: u8 = 4;
+/// The edge's end point is a corner whose join lies away from the fill.
+const OUT_END: u8 = 8;
 
 impl EdgeIndex {
     fn from_edges(edges: Vec<(Point, Point, u32, bool)>) -> EdgeIndex {
@@ -89,6 +108,7 @@ impl EdgeIndex {
         if edges.is_empty() {
             return EdgeIndex {
                 edges,
+                ends: Vec::new(),
                 buckets,
                 y0: 0.0,
                 inv_h: 0.0,
@@ -104,6 +124,7 @@ impl EdgeIndex {
         }
         EdgeIndex {
             edges,
+            ends: Vec::new(),
             buckets,
             y0: ymin,
             inv_h,
@@ -145,7 +166,17 @@ impl EdgeIndex {
     /// An early-exit scan: an edge whose box is already beyond the radius
     /// cannot qualify, and the first hit ends the scan. Callers
     /// special-case non-positive `r_sq`.
-    fn within_where(&self, p: Point, r_sq: f64, keep: impl Fn(u32, bool) -> bool) -> bool {
+    ///
+    /// An edge does not count where `p` lies past an end flagged in `skip`.
+    /// The nearest point is then a corner, and around a corner the band
+    /// covers its join, which [`SourceIndex::is_clear_of_joined`] tests.
+    fn within_where(
+        &self,
+        p: Point,
+        r_sq: f64,
+        keep: impl Fn(u32, bool) -> bool,
+        skip: u8,
+    ) -> bool {
         let n = self.buckets.len();
         let r = crate::math::sqrt(r_sq);
         let lo = crate::math::floor((p.y - r - self.y0) * self.inv_h).clamp(0.0, (n - 1) as f64)
@@ -166,10 +197,22 @@ impl EdgeIndex {
                 let ab = b - a;
                 let len2 = ab.hypot2();
                 let t = if len2 > 0.0 {
-                    ((p - a).dot(ab) / len2).clamp(0.0, 1.0)
+                    (p - a).dot(ab) / len2
                 } else {
                     0.0
                 };
+                if skip != 0 && !(0.0..=1.0).contains(&t) {
+                    let ends = self.ends.get(ix as usize).copied().unwrap_or(0);
+                    let past = if t < 0.0 {
+                        FILL_START | OUT_START
+                    } else {
+                        FILL_END | OUT_END
+                    };
+                    if ends & skip & past != 0 {
+                        continue;
+                    }
+                }
+                let t = t.clamp(0.0, 1.0);
                 if ((p - a) - t * ab).hypot2() < r_sq {
                     return true;
                 }
@@ -194,6 +237,149 @@ impl EdgeIndex {
 pub(crate) struct SourceIndex {
     index: EdgeIndex,
     flat_tol: f64,
+    /// The contours' corners, where a band emits a join, and their ordinals
+    /// bucketed by `y` like the edges. Empty unless built `with_joins`.
+    corners: Vec<Corner>,
+    corner_buckets: Vec<Vec<u32>>,
+    /// The farthest any join reaches from its corner, at the widest width
+    /// asked about. A query searches its bucket within this distance in `x`.
+    corner_reach: f64,
+}
+
+/// A corner of a source contour: a joint where the outline turns by more
+/// than the join-omission threshold, so a band emits a join there.
+///
+/// A band covers the points within its width of an edge, measured square
+/// to the edge, plus its joins. At a corner the two edges' strips leave a
+/// wedge between their normals on the outer side of the turn. The join
+/// fills that wedge: a disc around the corner for a round join, a triangle
+/// for a bevel, a kite for a miter. Plain distance treats every corner as
+/// round. A bevel chord then looks too close to its corner and is pruned,
+/// although it is the true boundary of the region. Where the boundary is
+/// mostly chords, as across a star's arms or between a gear's teeth, the
+/// region would tear apart.
+///
+/// A one-sided band emits a join only where its side is the outer side of
+/// the turn, so a query counts only the joins on the side being built. A
+/// corner on the other side keeps the plain distance, a disc. A miter's
+/// kite there reaches up to the miter limit times the width, and counting
+/// it would prune real boundary across a thin wall that no raw offset
+/// replaces.
+#[derive(Copy, Clone)]
+struct Corner {
+    v: Point,
+    /// Unit normals of the incoming and outgoing segments, on the outer
+    /// side of the turn. The join spans the wedge between them.
+    a: Vec2,
+    b: Vec2,
+    /// Where a miter applies, its tip at unit width, `(a + b) / (1 + a·b)`.
+    miter: Option<Vec2>,
+    /// How far from `v` the join reaches at unit width.
+    reach: f64,
+    round: bool,
+    /// Whether the join lies on the fill side, which is the right of travel
+    /// once the contours are normalised and the side an erosion offsets to.
+    into_fill: bool,
+    tag: u32,
+}
+
+impl Corner {
+    /// The corner at a joint where the incoming segment ends with tangent
+    /// `t_in` and the outgoing one starts with `t_out`, if a band emits a
+    /// join there. Mirrors `Band::do_join`.
+    fn at(
+        v: Point,
+        t_in: Vec2,
+        t_out: Vec2,
+        join: Join,
+        miter_limit: f64,
+        join_thresh: f64,
+        tag: u32,
+    ) -> Option<Corner> {
+        let cross = t_in.cross(t_out);
+        let dot = t_in.dot(t_out);
+        let hypot = math::hypot(cross, dot);
+        if hypot == 0.0 || (dot > 0.0 && cross.abs() < hypot * join_thresh) {
+            return None;
+        }
+        let (h_in, h_out) = (t_in.hypot(), t_out.hypot());
+        // Right normals. In Y-down a positive `cross` is a right turn, and
+        // its outer side is the left.
+        let n_in = t_in.turn_90() * (1.0 / h_in);
+        let n_out = t_out.turn_90() * (1.0 / h_out);
+        let (a, b) = if cross > 0.0 {
+            (-n_in, -n_out)
+        } else {
+            (n_in, n_out)
+        };
+        let miter_ok = 2.0 * hypot < (hypot + dot) * miter_limit * miter_limit;
+        let miter = (join == Join::Miter && miter_ok).then(|| miter_tip(a, b));
+        Some(Corner {
+            v,
+            a,
+            b,
+            miter,
+            reach: miter.map_or(1.0, |m| m.hypot().max(1.0)),
+            round: join == Join::Round,
+            into_fill: cross <= 0.0,
+            tag,
+        })
+    }
+
+    /// Take the join's normals from the flattened edges that meet here, not
+    /// from the exact tangents. Where a curve's first chord leans away from
+    /// its tangent, the exact normals would leave a sliver between the join
+    /// and the edge's strip.
+    fn reshape(&mut self, d_in: Vec2, d_out: Vec2) {
+        let (h_in, h_out) = (d_in.hypot(), d_out.hypot());
+        if h_in == 0.0 || h_out == 0.0 {
+            return;
+        }
+        let sign = if self.into_fill { 1.0 } else { -1.0 };
+        self.a = d_in.turn_90() * (sign / h_in);
+        self.b = d_out.turn_90() * (sign / h_out);
+        if self.miter.is_some() {
+            let m = miter_tip(self.a, self.b);
+            self.miter = Some(m);
+            self.reach = m.hypot().max(1.0);
+        }
+    }
+
+    /// Whether `p` lies strictly inside this corner's join at width `r`.
+    fn covers(&self, p: Point, r: f64) -> bool {
+        let d = p - self.v;
+        if d.hypot2() >= (r * self.reach) * (r * self.reach) {
+            return false;
+        }
+        let q = d * (1.0 / r);
+        if self.round {
+            return q.hypot2() < 1.0;
+        }
+        match self.miter {
+            Some(m) => inside_convex(q, &[Vec2::ZERO, self.a, m, self.b]),
+            None => inside_convex(q, &[Vec2::ZERO, self.a, self.b]),
+        }
+    }
+}
+
+/// The miter tip between unit normals `a` and `b`, at unit width.
+fn miter_tip(a: Vec2, b: Vec2) -> Vec2 {
+    (a + b) * (1.0 / (1.0 + a.dot(b)))
+}
+
+/// Whether `q` lies strictly inside the convex polygon `poly`, in either
+/// orientation. A degenerate polygon contains nothing.
+fn inside_convex(q: Vec2, poly: &[Vec2]) -> bool {
+    let mut sign = 0.0;
+    for (i, &p0) in poly.iter().enumerate() {
+        let p1 = poly[(i + 1) % poly.len()];
+        let c = (p1 - p0).cross(q - p0);
+        if c == 0.0 || (sign != 0.0 && (c > 0.0) != (sign > 0.0)) {
+            return false;
+        }
+        sign = c;
+    }
+    true
 }
 
 /// Lower bound on a flattening tolerance, as a fraction of the geometry's
@@ -261,7 +447,195 @@ impl SourceIndex {
         SourceIndex {
             index: EdgeIndex::from_edges(edges),
             flat_tol,
+            corners: Vec::new(),
+            corner_buckets: Vec::new(),
+            corner_reach: 0.0,
         }
+    }
+
+    /// An index over closed `contours`, tagged by ordinal, that also knows
+    /// where a band with `join` emits joins; see [`Corner`]. `reach` is the
+    /// widest width [`SourceIndex::is_clear_of_joined`] will be asked about.
+    pub(crate) fn with_joins(
+        contours: &[BezPath],
+        flat_tol: f64,
+        join: Join,
+        miter_limit: f64,
+        join_thresh: f64,
+        reach: f64,
+    ) -> Self {
+        let extent = contours
+            .iter()
+            .map(|c| c.control_box().size().max_side())
+            .fold(0.0, f64::max);
+        let flat_tol = flat_tol.max(extent * MIN_RELATIVE_FLAT_TOL).max(1e-9);
+        let mut edges: Vec<(Point, Point, u32, bool)> = Vec::new();
+        let mut ends: Vec<u8> = Vec::new();
+        let mut corners: Vec<Corner> = Vec::new();
+        for (tag, contour) in contours.iter().enumerate() {
+            let tag = tag as u32;
+            let segs: Vec<PathSeg> = contour
+                .segments()
+                .filter(|s| !math::is_degenerate(s))
+                .collect();
+            let n = segs.len();
+            if n == 0 {
+                continue;
+            }
+            // The corner, if any, at the joint where `segs[j]` starts.
+            let first = corners.len();
+            let mut corner_at: Vec<Option<usize>> = alloc::vec![None; n];
+            for j in 0..n {
+                let (_, t_in) = crate::expand::tangents(&segs[(j + n - 1) % n]);
+                let (t_out, _) = crate::expand::tangents(&segs[j]);
+                let v = segs[j].start();
+                if let Some(c) = Corner::at(v, t_in, t_out, join, miter_limit, join_thresh, tag) {
+                    corner_at[j] = Some(corners.len());
+                    corners.push(c);
+                }
+            }
+            let start = segs[0].start();
+            if corners.len() == first {
+                // No corners: plain edges, no bookkeeping.
+                let mut last = start;
+                kurbo::flatten(contour.iter(), flat_tol, |el| {
+                    let p = match el {
+                        PathEl::LineTo(p) => p,
+                        PathEl::ClosePath => start,
+                        _ => return,
+                    };
+                    if (p - last).hypot2() > 0.0 {
+                        edges.push((last, p, tag, true));
+                        ends.push(0);
+                        last = p;
+                    }
+                });
+                continue;
+            }
+            // The edges that meet at each of this contour's corners.
+            let mut meeting = alloc::vec![(usize::MAX, usize::MAX); corners.len() - first];
+            {
+                let bits = |c: usize| {
+                    if corners[c].into_fill {
+                        (FILL_START, FILL_END)
+                    } else {
+                        (OUT_START, OUT_END)
+                    }
+                };
+                // Flatten the whole contour in one call, since `flatten`
+                // sets up its buffers per call. It ends every element exactly
+                // on its end point, so segment `k` is done when an edge ends
+                // on `segs[k].end()`. Counting segments instead of matching
+                // corner positions keeps a contour that passes through one
+                // of its corners earlier from being taken for the corner.
+                let mut k = 0;
+                let mut last = segs[0].start();
+                let mut entering = corner_at[0];
+                let mut push = |p: Point, edges: &mut Vec<_>, ends: &mut Vec<u8>| {
+                    if (p - last).hypot2() == 0.0 {
+                        return;
+                    }
+                    let ix = edges.len();
+                    edges.push((last, p, tag, true));
+                    ends.push(0);
+                    if let Some(c) = entering.take() {
+                        ends[ix] |= bits(c).0;
+                        meeting[c - first].1 = ix;
+                    }
+                    if k < n && p == segs[k].end() {
+                        k += 1;
+                        if let Some(c) = corner_at[k % n] {
+                            ends[ix] |= bits(c).1;
+                            meeting[c - first].0 = ix;
+                            if k < n {
+                                entering = Some(c);
+                            }
+                        }
+                    }
+                    last = p;
+                };
+                kurbo::flatten(contour.iter(), flat_tol, |el| match el {
+                    PathEl::LineTo(p) => push(p, &mut edges, &mut ends),
+                    PathEl::ClosePath => push(start, &mut edges, &mut ends),
+                    _ => {}
+                });
+            }
+            for (c, &(e_in, e_out)) in corners[first..].iter_mut().zip(&meeting) {
+                if let (Some(&(a0, a1, _, _)), Some(&(b0, b1, _, _))) =
+                    (edges.get(e_in), edges.get(e_out))
+                {
+                    c.reshape(a1 - a0, b1 - b0);
+                }
+            }
+        }
+        let mut index = EdgeIndex::from_edges(edges);
+        index.ends = ends;
+        let n_buckets = if corners.is_empty() {
+            0
+        } else {
+            index.buckets.len()
+        };
+        let mut corner_buckets: Vec<Vec<u32>> = alloc::vec![Vec::new(); n_buckets];
+        let mut corner_reach: f64 = 0.0;
+        for (i, c) in corners.iter().enumerate() {
+            let r = reach * c.reach;
+            corner_reach = corner_reach.max(r);
+            let lo = index.bucket_ix(c.v.y - r);
+            let hi = index.bucket_ix(c.v.y + r);
+            for bucket in &mut corner_buckets[lo..=hi] {
+                bucket.push(i as u32);
+            }
+        }
+        // Sort each bucket by `x`, so a query visits only the corners within
+        // reach sideways, not every corner in the bucket. A bucket across
+        // the top of a gear holds dozens of teeth.
+        for bucket in &mut corner_buckets {
+            bucket.sort_by(|&i, &j| corners[i as usize].v.x.total_cmp(&corners[j as usize].v.x));
+        }
+        SourceIndex {
+            index,
+            flat_tol,
+            corners,
+            corner_buckets,
+            corner_reach,
+        }
+    }
+
+    /// Whether `p` lies outside the band of width `r` along contour
+    /// `contour`, joins included: farther than `r` from every edge, measured
+    /// square to it, and outside every join on the side `into_fill` picks.
+    /// With round joins this is the plain distance test.
+    pub(crate) fn is_clear_of_joined(
+        &self,
+        p: Point,
+        r: f64,
+        contour: usize,
+        into_fill: bool,
+    ) -> bool {
+        if r <= 0.0 {
+            return true;
+        }
+        let skip = if into_fill {
+            FILL_START | FILL_END
+        } else {
+            OUT_START | OUT_END
+        };
+        if self
+            .index
+            .within_where(p, r * r, |tag, real| real && tag == contour as u32, skip)
+        {
+            return false;
+        }
+        let Some(bucket) = self.corner_buckets.get(self.index.bucket_ix(p.y)) else {
+            return true;
+        };
+        let x0 = p.x - self.corner_reach;
+        let from = bucket.partition_point(|&i| self.corners[i as usize].v.x < x0);
+        !bucket[from..]
+            .iter()
+            .map(|&i| &self.corners[i as usize])
+            .take_while(|c| c.v.x <= p.x + self.corner_reach)
+            .any(|c| c.tag == contour as u32 && c.into_fill == into_fill && c.covers(p, r))
     }
 
     /// Whether `p` is at least `sqrt(thresh_sq)` away from contour
@@ -272,15 +646,68 @@ impl SourceIndex {
         if thresh_sq <= 0.0 {
             return true;
         }
-        !self.index.within_where(p, thresh_sq, |tag, real| {
-            real && contour.is_none_or(|c| c as u32 == tag)
-        })
+        !self.index.within_where(
+            p,
+            thresh_sq,
+            |tag, real| real && contour.is_none_or(|c| c as u32 == tag),
+            0,
+        )
     }
 
     /// Nonzero winding number of the flattened path at `p` (implicit closing
     /// chords included).
     pub(crate) fn winding(&self, p: Point) -> i32 {
         self.index.winding_where(p, |_| true)
+    }
+
+    /// Whether every edge of the path bounds its fill, given which contours
+    /// run clockwise. No two edges may cross, and each contour must lie in
+    /// the others' fill exactly as deep as a boundary does: outside all of
+    /// them if it runs clockwise, inside one if it is a hole. Overlapping
+    /// contours fail, as does one nested in another of the same direction.
+    fn bounds_fill_everywhere(&self, cw: &[bool]) -> bool {
+        let edges = &self.index.edges;
+        let x_range = |i: u32| {
+            let (a, b, _, _) = edges[i as usize];
+            (a.x.min(b.x), a.x.max(b.x))
+        };
+        // Per bucket, sweep in `x`: only edges whose spans overlap can cross.
+        let mut order: Vec<u32> = Vec::new();
+        let mut active: Vec<u32> = Vec::new();
+        for bucket in &self.index.buckets {
+            order.clear();
+            order.extend_from_slice(bucket);
+            order.sort_by(|&i, &j| x_range(i).0.total_cmp(&x_range(j).0));
+            active.clear();
+            for &i in &order {
+                let (a, b, ti, _) = edges[i as usize];
+                let x0 = x_range(i).0;
+                active.retain(|&j| x_range(j).1 >= x0);
+                for &j in &active {
+                    let (c, d, tj, _) = edges[j as usize];
+                    // Neighbours along a contour share an end exactly.
+                    if ti == tj && (b == c || d == a) {
+                        continue;
+                    }
+                    let (ab, cd) = (b - a, d - c);
+                    if ab.cross(c - a) * ab.cross(d - a) < 0.0
+                        && cd.cross(a - c) * cd.cross(b - c) < 0.0
+                    {
+                        return false;
+                    }
+                }
+                active.push(i);
+            }
+        }
+        let mut seen = alloc::vec![false; cw.len()];
+        edges.iter().all(|&(a, _, tag, _)| {
+            let tag = tag as usize;
+            if tag >= cw.len() || core::mem::replace(&mut seen[tag], true) {
+                return true;
+            }
+            let others = self.index.winding_where(a, |t| t as usize != tag);
+            others == if cw[tag] { 0 } else { 1 }
+        })
     }
 
     /// Flattening tolerance, subtracted from distance thresholds.
@@ -363,7 +790,7 @@ impl RawIndex {
             return false;
         }
         self.index
-            .within_where(p, r_sq, |tag, _| tag as usize != owner)
+            .within_where(p, r_sq, |tag, _| tag as usize != owner, 0)
     }
 }
 
@@ -391,10 +818,6 @@ pub(crate) fn region_loops(
 
     // --- raw offsets, one per contour ---
     let mut raws: Vec<BezPath> = Vec::with_capacity(contours.len());
-    // Per-raw, per-segment relaxation of the distance prune: `1` for plain
-    // offset geometry, `cos(φ/2)` where a bevel chord legitimately cuts
-    // its corner. See `keep_at`.
-    let mut raws_relax: Vec<Vec<f64>> = Vec::with_capacity(contours.len());
     for c in contours {
         let side = match kind {
             RegionKind::Erosion => c.fill_side,
@@ -408,16 +831,11 @@ pub(crate) fn region_loops(
             raw_offset: true,
             ..*base
         };
-        let join_spans = {
+        {
             let mut band = Band::new(params, left, right, scratch, sink);
             band.suppress_finish = true;
             band.run(c.els.iter().copied());
-            if side == StrokeSide::Left {
-                core::mem::take(&mut band.left_join_segs)
-            } else {
-                core::mem::take(&mut band.right_join_segs)
-            }
-        };
+        }
         let raw: &BezPath = if side == StrokeSide::Left {
             left
         } else {
@@ -425,7 +843,6 @@ pub(crate) fn region_loops(
         };
         if raw.elements().len() < 2 {
             raws.push(BezPath::new());
-            raws_relax.push(Vec::new());
             continue;
         }
         let mut closed = raw.clone();
@@ -439,26 +856,13 @@ pub(crate) fn region_loops(
         // cutter.
         if closed.control_box().size().max_side() <= fuzz {
             raws.push(BezPath::new());
-            raws_relax.push(Vec::new());
             continue;
         }
-        let n_segs = closed.segments().count();
-        let mut relax = alloc::vec![1.0; n_segs];
-        for (s0, s1, factor) in join_spans {
-            for r in relax
-                .iter_mut()
-                .take((s1 as usize).min(n_segs))
-                .skip(s0 as usize)
-            {
-                *r = f64::min(*r, factor);
-            }
-        }
         raws.push(closed);
-        raws_relax.push(relax);
     }
 
     // --- find every mutual and self intersection of the offsets ---
-    let cut = CutSegs::collect(&raws, &raws_relax, accuracy);
+    let cut = CutSegs::collect(&raws, accuracy);
 
     // Approximation error is subtracted from the `dist >= w` test so that a
     // legitimate boundary piece is never pruned. Below roughly twice the
@@ -488,25 +892,13 @@ pub(crate) fn region_loops(
     let cw: Vec<bool> = contours.iter().map(|c| c.els.area() >= 0.0).collect();
     let live = raws.iter().filter(|r| r.elements().len() >= 2).count();
     let raw_index = (live >= 2).then(|| RawIndex::new(&raws, index.slack()));
-    // The join relaxation applies to the dilation only. There, cutting a
-    // corner is the style the caller asked for, and the strict test tears
-    // the union apart; the dilation never folds inward, so nothing needs
-    // the slack as a guard. For the erosion the distance test is the
-    // saturation guard — a spurious survivor becomes a hole in a shape that
-    // should be solid — and dropping a bevel chord costs nothing there,
-    // because `stitch` bridges the gap with the same chord.
-    let relax_joins = kind == RegionKind::Dilation;
-    let keep_at = |p: Point, owner: usize, relax: f64| {
-        // Self-validity: far enough from the piece's own contour, which
-        // prunes fold-over past the local thickness. Only the own contour.
-        // Proximity to another contour says nothing under miter and bevel
-        // joins, whose loops deviate from the distance-`w` set at corners;
-        // cross-contour validity is the winding test below. A bevel chord
-        // legitimately cuts its corner, so its own threshold is scaled by
-        // `cos(φ/2)`. That bound matters: a blanket exemption let huge join
-        // fans survive inside the shape at extreme widths.
-        let thr = if relax_joins { thresh * relax } else { thresh };
-        if !index.is_clear_of(p, thr * thr, Some(owner)) {
+    let keep_at = |p: Point, owner: usize| {
+        // Self-validity: outside the band of the piece's own contour, which
+        // prunes fold-over past the local thickness. Only the own contour:
+        // cross-contour validity is the winding test below. The joins keep
+        // their real shape, because plain distance would prune bevel chords
+        // that are the true boundary; see `Corner`.
+        if !index.is_clear_of_joined(p, thresh, owner, want_filled) {
             return false;
         }
         // The right side of the fill.
@@ -536,12 +928,12 @@ pub(crate) fn region_loops(
     // The first two samples settle the majority whenever they agree, which
     // is the overwhelmingly common case, so the third is only paid for on a
     // piece that actually straddles a decision.
-    let keep_piece = |seg: &PathSeg, owner: usize, relax: f64| {
-        let first = keep_at(seg.eval(0.5), owner, relax);
-        if keep_at(seg.eval(0.25), owner, relax) == first {
+    let keep_piece = |seg: &PathSeg, owner: usize| {
+        let first = keep_at(seg.eval(0.5), owner);
+        if keep_at(seg.eval(0.25), owner) == first {
             return first;
         }
-        keep_at(seg.eval(0.75), owner, relax)
+        keep_at(seg.eval(0.75), owner)
     };
 
     // --- fast path: nothing cuts ---
@@ -563,8 +955,7 @@ pub(crate) fn region_loops(
             let (mut valid, mut invalid) = (0usize, 0usize);
             for (ix, seg) in raw.segments().enumerate() {
                 if sample_ixs.contains(&ix) {
-                    let relax = raws_relax[ri].get(ix).copied().unwrap_or(1.0);
-                    if keep_at(seg.eval(0.5), ri, relax) {
+                    if keep_at(seg.eval(0.5), ri) {
                         valid += 1;
                     } else {
                         invalid += 1;
@@ -589,10 +980,47 @@ pub(crate) fn region_loops(
     }
 
     // --- cut, prune, stitch ---
+    // A piece that leaves a crossing on the band side of the other strand
+    // is pruned, whatever the distance test says. Each offset strand bounds
+    // its own band: to its left for an erosion, to its right for a
+    // dilation. So of a strand's two pieces at a crossing, exactly one lies
+    // inside the other strand's band, and it stays there until its next
+    // cut. The distance test misses this where strands cross at a shallow
+    // angle. Past the crossing the piece sinks into the other band only
+    // slowly, and it is kept until it lies deeper than the slack, which may
+    // never happen. Near collapse this is typical: on a 24-tooth gear
+    // eroded to 8/9 of its inner radius, arcs ran up to 0.64 deep into
+    // their neighbours' bands against a slack of 0.74. The overshoot
+    // stitched into extra loops that filled the middle.
+    //
+    // This rule needs two things. First, the crossing strand must run the
+    // same way as its source. The short connector that rejoins two offsets
+    // across an inner turn runs backwards, and so does the folded part of
+    // a curve's offset. Their band side faces away from the source. A
+    // strand that runs with its source has that source `w` away across it,
+    // which the foot test checks. Second, the band's far edge must be an
+    // offset strand too, so a piece cannot leave the band without a cut.
+    // That fails where contours overlap: an edge that runs through another
+    // contour's fill has band on both sides, and a piece can leave across
+    // the edge itself, as on Inter's `4`, whose stem overlaps the diagonal
+    // and the bar. So the rule applies only when every edge of the source
+    // bounds the fill. That check sweeps the whole source, so it runs once,
+    // and only when a crossing would ban something.
+    //
+    // `materialize` also ignores crossings too shallow to read, and pieces
+    // that run on too deep for their crossing to explain.
+    let band_normal = if want_filled { -1.0 } else { 1.0 };
+    let foot_r = 0.5 * width;
+    let one_sided = core::cell::OnceCell::new();
+    let bounds_band = |x: Point, dir: Vec2, owner: usize| {
+        let foot = x + dir.turn_90() * (band_normal * width);
+        !index.is_clear_of(foot, foot_r * foot_r, Some(owner))
+            && *one_sided.get_or_init(|| index.bounds_fill_everywhere(&cw))
+    };
     let kept: Vec<Option<(usize, PathSeg)>> = cut
-        .materialize()
+        .materialize(want_filled, bounds_band, MAX_BAN_DEPTH * fuzz)
         .into_iter()
-        .map(|(owner, seg, relax)| keep_piece(&seg, owner, relax).then_some((owner, seg)))
+        .map(|(owner, seg, banned)| (!banned && keep_piece(&seg, owner)).then_some((owner, seg)))
         .collect();
 
     drop_unresolvable(stitch(&kept, accuracy, width), fuzz)
@@ -650,9 +1078,11 @@ fn drop_unresolvable(loops: Vec<BezPath>, fuzz: f64) -> Vec<BezPath> {
 struct CutSegs {
     segs: Vec<PathSeg>,
     owner: Vec<usize>,
-    /// Distance-prune relaxation per segment (see `region_loops`).
-    relax: Vec<f64>,
     cuts: Vec<Vec<f64>>,
+    /// The crossings behind the cuts, as `(i, ta, j, tb)`: segment `i` at
+    /// `ta` meets segment `j` at `tb`. Only the cut path reads them, so
+    /// their angles are worked out later, in `materialize`.
+    crossings: Vec<(u32, f64, u32, f64)>,
     /// Whether any cut lands in a segment's interior. `subdivide_at` drops
     /// endpoint touches anyway, so without interior cuts the subdivision is
     /// a no-op and the fast path applies.
@@ -660,19 +1090,17 @@ struct CutSegs {
 }
 
 impl CutSegs {
-    fn collect(raws: &[BezPath], raws_relax: &[Vec<f64>], accuracy: f64) -> CutSegs {
+    fn collect(raws: &[BezPath], accuracy: f64) -> CutSegs {
         // Flatten to a segment list, remembering the owner and the index
         // range of each contour so adjacency can be recognised.
         let mut segs: Vec<PathSeg> = Vec::new();
         let mut owner: Vec<usize> = Vec::new();
-        let mut relax: Vec<f64> = Vec::new();
         let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(raws.len());
         for (ix, raw) in raws.iter().enumerate() {
             let start = segs.len();
-            for (k, seg) in raw.segments().enumerate() {
+            for seg in raw.segments() {
                 segs.push(seg);
                 owner.push(ix);
-                relax.push(raws_relax[ix].get(k).copied().unwrap_or(1.0));
             }
             ranges.push((start, segs.len()));
         }
@@ -682,6 +1110,7 @@ impl CutSegs {
             .map(kurbo::ParamCurveExtrema::bounding_box)
             .collect();
         let mut cuts: Vec<Vec<f64>> = alloc::vec![Vec::new(); n];
+        let mut crossings: Vec<(u32, f64, u32, f64)> = Vec::new();
         let mut any_interior = false;
         let add = |cuts: &mut Vec<Vec<f64>>, any: &mut bool, ix: usize, t: f64| {
             *any |= t > split::T_EPS && t < 1.0 - split::T_EPS;
@@ -689,8 +1118,12 @@ impl CutSegs {
         };
 
         for i in 0..n {
-            for t in split::segment_self_intersection_params(&segs[i], accuracy) {
-                add(&mut cuts, &mut any_interior, i, t);
+            let selfs = split::segment_self_intersection_params(&segs[i], accuracy);
+            for pair in selfs.chunks_exact(2) {
+                let (ta, tb) = (pair[0], pair[1]);
+                add(&mut cuts, &mut any_interior, i, ta);
+                add(&mut cuts, &mut any_interior, i, tb);
+                crossings.push((i as u32, ta, i as u32, tb));
             }
             for j in (i + 1)..n {
                 // Cheap box rejection before the subdivision search.
@@ -705,29 +1138,137 @@ impl CutSegs {
                 {
                     add(&mut cuts, &mut any_interior, i, ta);
                     add(&mut cuts, &mut any_interior, j, tb);
+                    crossings.push((i as u32, ta, j as u32, tb));
                 }
             }
         }
         CutSegs {
             segs,
             owner,
-            relax,
             cuts,
+            crossings,
             any_interior,
         }
     }
 
-    /// Subdivide every segment at its cuts. Returns `(owner, piece, relax)`
-    /// in owner-major path order.
-    fn materialize(mut self) -> Vec<(usize, PathSeg, f64)> {
+    /// Subdivide every segment at its cuts. Returns `(owner, piece,
+    /// banned)` in owner-major path order. `banned` marks a piece that
+    /// leaves one of its crossings on the band side of the other strand.
+    ///
+    /// The band lies to the left of every offset strand when `band_left`,
+    /// as for an erosion, and to the right otherwise.
+    /// `bounds_band(x, dir, owner)` says whether a strand of loop `owner`
+    /// passing `x` in unit direction `dir` really bounds its band there.
+    /// A strand that does not bans nothing. Nor does a crossing ban a piece
+    /// that would run deeper than `max_depth` into the band.
+    fn materialize(
+        mut self,
+        band_left: bool,
+        bounds_band: impl Fn(Point, Vec2, usize) -> bool,
+        max_depth: f64,
+    ) -> Vec<(usize, PathSeg, bool)> {
+        // Per segment, its crossings as `(t, sin)`: the cut parameter, and
+        // the sine of the angle from the other strand's direction to this
+        // one's. It is positive where this strand passes from the other's
+        // left to its right. For a band on the right the sign is flipped, so
+        // negative always means leaving into the band.
+        let sign = if band_left { 1.0 } else { -1.0 };
+        let mut sides: Vec<Vec<(f64, f64)>> = alloc::vec![Vec::new(); self.segs.len()];
+        for &(i, ta, j, tb) in &self.crossings {
+            let (i, j) = (i as usize, j as usize);
+            let Some((x, da, db)) = crossing(&self.segs[i], ta, &self.segs[j], tb) else {
+                continue;
+            };
+            let sin = sign * db.cross(da);
+            if sin.abs() < MIN_CROSSING_SINE || (sin.abs() < MIN_OPPOSED_SINE && da.dot(db) < 0.0) {
+                continue;
+            }
+            if bounds_band(x, db, self.owner[j]) {
+                sides[i].push((ta, sin));
+            }
+            if bounds_band(x, da, self.owner[i]) {
+                sides[j].push((tb, -sin));
+            }
+        }
         let mut out = Vec::with_capacity(self.segs.len());
-        for i in 0..self.segs.len() {
-            for piece in split::subdivide_at(&self.segs[i], &mut self.cuts[i]) {
-                out.push((self.owner[i], piece, self.relax[i]));
+        for (i, sides) in sides.iter().enumerate() {
+            let pieces = split::subdivide_at(&self.segs[i], &mut self.cuts[i]);
+            let first = out.len();
+            for piece in pieces {
+                out.push((self.owner[i], piece, false));
+            }
+            // `subdivide_at` leaves the remaining cuts in place, sorted.
+            // Piece `k` runs from cut `k - 1` to cut `k`, and the segment's
+            // ends stand in before the first cut and after the last.
+            let ts = &self.cuts[i];
+            for &(t, sin) in sides {
+                // The piece boundary this crossing landed on: the nearest
+                // remaining cut, or an end of the segment.
+                let b = ts.partition_point(|&c| c < t);
+                let below = if b == 0 { 0.0 } else { ts[b - 1] };
+                let above = ts.get(b).copied().unwrap_or(1.0);
+                let b = if t - below <= above - t { b } else { b + 1 };
+                // Leaving into the band bans the piece that starts here.
+                // Arriving from the band bans the piece that ends here.
+                let k = if sin < 0.0 {
+                    if b > ts.len() {
+                        continue;
+                    }
+                    b
+                } else {
+                    if b == 0 {
+                        continue;
+                    }
+                    b - 1
+                };
+                // A piece that runs deeper than `max_depth` past its
+                // crossing, a few times the slack, would fail the distance
+                // test if it were still in the band. If it passes anyway, it
+                // left the band in a way the crossing cannot see, so the
+                // crossing says nothing about it. That happens across a
+                // stroke a little thinner than twice the width: what
+                // survives of both inner offsets barely passes the distance
+                // test, and only cancels while both remain.
+                let piece = &out[first + k].1;
+                if (piece.end() - piece.start()).hypot() * sin.abs() <= max_depth {
+                    out[first + k].2 = true;
+                }
             }
         }
         out
     }
+}
+
+/// Below this sine a crossing bans nothing, and its pieces are left to the
+/// distance test. At such shallow angles, rounding in the directions can
+/// decide which side a piece leaves on.
+const MIN_CROSSING_SINE: f64 = 1e-3;
+
+/// The same floor for strands running within about 3° of opposite ways.
+/// Such a pair is usually an offset and the backwards connector beside it,
+/// and on glyph outlines their crossings cut long runs of real boundary.
+/// Strands running the same way keep the lower floor above: on a fine gear
+/// the bevel chords of neighbouring roots cross within a degree of each
+/// other, and that overshoot has to be pruned.
+const MIN_OPPOSED_SINE: f64 = 0.05;
+
+/// How deep a banned piece may run into the band past its crossing, in
+/// multiples of the pruning fuzz; see `materialize`. Near an erosion's
+/// collapse the overshoot sinks only a fraction of the fuzz.
+const MAX_BAN_DEPTH: f64 = 4.0;
+
+/// Where `a` near `ta` crosses `b` near `tb`, and the unit directions of
+/// both there. `None` where either direction vanishes.
+///
+/// The search already moves its crossings onto the curves where it can.
+/// Polishing again costs one evaluation for those, and covers the ones it
+/// had to leave as found.
+fn crossing(a: &PathSeg, ta: f64, b: &PathSeg, tb: f64) -> Option<(Point, Vec2, Vec2)> {
+    let (ta, tb) = split::polish_crossing(a, ta, b, tb);
+    let (da, db) = (split::deriv(a, ta), split::deriv(b, tb));
+    let (la, lb) = (da.hypot(), db.hypot());
+    (la > 0.0 && lb > 0.0 && (la * lb).is_finite())
+        .then(|| (a.eval(ta).midpoint(b.eval(tb)), da / la, db / lb))
 }
 
 /// Whether a closed loop bounds meaningful area: its absolute signed area
@@ -761,11 +1302,10 @@ const MAX_BRIDGE: f64 = 8.0;
 /// At an intersection the surviving strand continues from the same point,
 /// so the walk hands over to whichever unused piece starts there. That
 /// includes a piece belonging to another contour, which is how overlapping
-/// bands merge into a single boundary. Elsewhere — at a dropped bevel
-/// chord, a trimmed spike, or a piece whose validity changed where nothing
-/// cut it — it bridges with a line to the nearest survivor, of whichever
-/// contour, unless its own start is nearer and the loop closes. For a bevel
-/// join that line is the chord itself.
+/// bands merge into a single boundary. Elsewhere, as after a trimmed spike
+/// or a piece whose validity changed where nothing cut it, it bridges with
+/// a line to the nearest survivor of any contour, unless its own start is
+/// nearer and the loop closes.
 fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64, width: f64) -> Vec<BezPath> {
     let n = kept.len();
     // The match radius. A crossing's two cut points agree to within the
@@ -774,6 +1314,14 @@ fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64, width: f64) -> Vec<B
     // sixteenfold reached past the band itself (4 against a width of 2), so
     // the walk handed over to whatever piece of the boundary lay nearby, or
     // closed on its own start before going round.
+    //
+    // Even so, the radius can be longer than the pieces. Near collapse an
+    // erosion is a ring of short arcs: on a gear eroded to a tenth of its
+    // radius at tolerance 0.25, each is under two units long against a
+    // radius of 4. So coming back within the radius of the start closes the
+    // loop only if it bounds more than a sliver. Otherwise every walk would
+    // end after its first piece, and the sliver filter would drop the whole
+    // erosion.
     let eps = (accuracy * 16.0).min(0.25 * width).max(1e-9);
     let max_bridge = MAX_BRIDGE * width;
     let mut used = alloc::vec![false; n];
@@ -868,9 +1416,6 @@ fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64, width: f64) -> Vec<B
             let (_, seg) = kept[cur].unwrap();
             split::append_seg(&mut path, seg);
             let end = seg.end();
-            if (end - first_pt).hypot() <= eps {
-                break;
-            }
             // A survivor continuing from this exact point (any contour).
             let (kx, ky) = key(end);
             let mut next: Option<usize> = None;
@@ -893,6 +1438,17 @@ fn stitch(kept: &[Option<(usize, PathSeg)>], accuracy: f64, width: f64) -> Vec<B
                         }
                     }
                 }
+            }
+            // Back within the match radius of its start, the loop closes,
+            // unless it would be a sliver and a piece continues from here.
+            if (end - first_pt).hypot() <= eps
+                && (next.is_none() || {
+                    let mut closed = path.clone();
+                    closed.close_path();
+                    substantial_loop(&closed, accuracy)
+                })
+            {
+                break;
             }
             if next.is_none() {
                 // Otherwise the nearest survivor, bridged, unless the loop's

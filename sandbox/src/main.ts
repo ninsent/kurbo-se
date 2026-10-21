@@ -1,6 +1,8 @@
 import init, {
   expand_stroke_debug,
   gallery,
+  text_max_chars,
+  text_outline,
 } from "../wasm/pkg/kurbo_se_sandbox.js";
 
 type GalleryEntry = {
@@ -27,7 +29,15 @@ type DebugOut = {
 };
 
 const state = {
+  // "text" strokes the glyph outlines of `text` instead of a gallery shape.
+  source: "gallery" as "gallery" | "text",
   shapeIx: 4,
+  text: "Hello, kurbo-se!",
+  textSize: 120,
+  // Merge the glyph contours before stroking, so touching and overlapping
+  // letters and accents stroke as one outline. See wasm/src/union.rs.
+  // Off shows the font's contours as drawn, overlaps and all.
+  textUnion: true,
   width: 10,
   alignment: "center" as "center" | "inside" | "outside",
   side: "auto" as "auto" | "left" | "center" | "right",
@@ -62,6 +72,35 @@ const state = {
 
 let shapes: GalleryEntry[] = [];
 let lastExpandMs = 0;
+// Character limit for the text source. It is read from the wasm side at
+// boot, so the input and the Rust backstop agree.
+let textMax = 32;
+// The text source's outline, laid out by parley. Cached because render()
+// runs on every pan and zoom. Cleared when the text, size or union changes.
+let textShape: GalleryEntry | null = null;
+
+/// The shape being stroked: a gallery entry, or the typed text's outline.
+function currentShape(): GalleryEntry {
+  if (state.source === "text") {
+    textShape ??= JSON.parse(
+      text_outline(state.text, state.textSize, state.textUnion),
+    ) as GalleryEntry;
+    return textShape;
+  }
+  return shapes[state.shapeIx];
+}
+
+/// Text as the input would hold it. Line breaks are removed, as a
+/// single-line input strips them. The rest is cut to `textMax` UTF-16
+/// units like `maxlength`, without splitting a surrogate pair.
+function clampText(text: string): string {
+  let out = "";
+  for (const ch of text.replace(/[\r\n]+/g, "")) {
+    if (out.length + ch.length > textMax) break;
+    out += ch;
+  }
+  return out;
+}
 
 // ---------- tiny absolute-path d parser (M/L/Q/C/Z, kurbo's to_svg output) ----------
 type Parsed = {
@@ -298,8 +337,62 @@ function dashPatternInput(): HTMLElement {
   return n;
 }
 
+/// Text source input. Re-renders and refits the view as you type.
+/// `maxlength` stops typing and pasting at the limit, and the counter
+/// shows how close you are.
+function textInput(): HTMLElement[] {
+  const n = h("input", { type: "text", class: "text" });
+  n.maxLength = textMax;
+  n.placeholder = "Type your text";
+  n.spellcheck = false;
+  n.autocomplete = "off";
+  n.value = state.text;
+  const count = h("span", { class: "hex count" });
+  const sync = () => {
+    count.textContent = `${n.value.length}/${textMax}`;
+    count.classList.toggle("full", n.value.length >= textMax);
+  };
+  n.oninput = () => {
+    state.text = n.value;
+    textShape = null;
+    sync();
+    resetView();
+  };
+  sync();
+  return [n, count];
+}
+
 function buildPanel() {
   const panel = document.getElementById("panel")!;
+  const textRows = [
+    row("Text", ...textInput()),
+    row(
+      "Size",
+      ...slider(8, 400, 1, () => state.textSize, (v) => {
+        state.textSize = v;
+        textShape = null;
+        resetView();
+      }),
+    ),
+    row(
+      "Union",
+      checkbox(() => state.textUnion, (v) => {
+        state.textUnion = v;
+        textShape = null;
+      }),
+      h("span", { class: "hint", textContent: "merge overlaps" }),
+    ),
+    h(
+      "p",
+      { class: "note" },
+      h("b", { textContent: "Custom union: " }),
+      "overlapping glyph parts merge into one outline before stroking, curves kept.",
+    ),
+  ];
+  const showTextRows = () => {
+    for (const r of textRows) r.hidden = state.source !== "text";
+  };
+  showTextRows();
   panel.replaceChildren(
     h("h1", { innerHTML: "kurbo-se <span>stroke sandbox</span>" }),
     group(
@@ -307,14 +400,24 @@ function buildPanel() {
       row(
         "Gallery",
         select(
-          shapes.map((s, i) => [String(i), s.name]) as [string, string][],
-          () => String(state.shapeIx),
+          [
+            ...(shapes.map((s, i) => [String(i), s.name]) as [string, string][]),
+            ["text", "Text (type your own)"],
+          ],
+          () => (state.source === "text" ? "text" : String(state.shapeIx)),
           (v) => {
-            state.shapeIx = parseInt(v);
+            if (v === "text") {
+              state.source = "text";
+            } else {
+              state.source = "gallery";
+              state.shapeIx = parseInt(v);
+            }
+            showTextRows();
             resetView();
           },
         ),
       ),
+      ...textRows,
     ),
     group(
       "Fill",
@@ -409,7 +512,7 @@ function px(v: number): number {
 }
 
 function render() {
-  const shape = shapes[state.shapeIx];
+  const shape = currentShape();
   if (!shape) return;
   const t0 = performance.now();
   const debug: DebugOut = JSON.parse(
@@ -466,8 +569,10 @@ function render() {
     if (state.dashed && state.dashPattern.length > 0) {
       // SVG stroke-dasharray shares these semantics exactly — even entries
       // are dashes, odd-length lists double — so the oracle stays valid.
+      // So does stroke-dashoffset: kurbo reads the offset the same way, as
+      // the distance into the pattern where the path starts.
       attrs["stroke-dasharray"] = state.dashPattern.join(" ");
-      attrs["stroke-dashoffset"] = -state.dashOffset;
+      attrs["stroke-dashoffset"] = state.dashOffset;
     }
     ref.append(svgEl("path", attrs));
   }
@@ -583,12 +688,12 @@ function render() {
       return el;
     };
     stats.append(
-      item(`<b>${shapes[state.shapeIx].name}</b>`),
+      item(`<b>${shape.name}</b>`),
       item(`segs ${debug.inputSegs} → <b>${debug.outputSegs}</b>`),
       item(`expand <b>${lastExpandMs.toFixed(2)} ms</b>`),
       item(`tol ${state.tolerance}`),
       item(`miter limit ${debug.miterLimit.toFixed(3)}`),
-      ...debug.subpaths.map((sp, i) => {
+      ...debug.subpaths.slice(0, MAX_CHIPS).map((sp, i) => {
         const kind = sp.zeroLength
           ? "zero"
           : sp.closed
@@ -599,9 +704,18 @@ function render() {
         return el;
       }),
     );
+    if (debug.subpaths.length > MAX_CHIPS) {
+      stats.append(
+        h("span", { class: "chip", textContent: `+${debug.subpaths.length - MAX_CHIPS} more subpaths` }),
+      );
+    }
   }
   updateZoomPct();
 }
+
+/// Most per-subpath chips shown in the stats bar. Text has dozens of
+/// contours, and a chip for each would push the bar over the canvas.
+const MAX_CHIPS = 12;
 
 function updateZoomPct() {
   const el = document.getElementById("zoom-pct");
@@ -610,7 +724,7 @@ function updateZoomPct() {
 
 // ---------- view control ----------
 function resetView() {
-  const [x0, y0, x1, y1] = shapes[state.shapeIx].bbox;
+  const [x0, y0, x1, y1] = currentShape().bbox;
   const pad = Math.max(60, state.width * 3);
   state.view = {
     x: x0 - pad,
@@ -794,6 +908,13 @@ function applyQueryParams() {
     if (v !== null) set(v === "1" || v === "true");
   };
   num("shape", (v) => (state.shapeIx = Math.min(shapes.length - 1, Math.max(0, v | 0))));
+  // `shape=text` picks the text source. So does `text` without `shape`.
+  const text = q.get("text");
+  if (q.get("shape") === "text" || (text !== null && q.get("shape") === null))
+    state.source = "text";
+  if (text !== null) state.text = clampText(text);
+  num("textSize", (v) => (state.textSize = v));
+  flag("union", (v) => (state.textUnion = v));
   num("width", (v) => (state.width = v));
   str("alignment", ["center", "inside", "outside"], (v) => (state.alignment = v));
   str("side", ["auto", "left", "center", "right"], (v) => (state.side = v));
@@ -830,6 +951,7 @@ function applyQueryParams() {
 // ---------- boot ----------
 await init();
 shapes = JSON.parse(gallery());
+textMax = text_max_chars();
 applyQueryParams();
 buildPanel();
 setupViewControls();

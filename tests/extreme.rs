@@ -13,7 +13,7 @@
 //! The set-theoretic contract itself lives in `set_semantics.rs`. These are
 //! the concrete shapes and widths from the reports.
 
-use kurbo::{BezPath, Circle, Point, Rect, Shape};
+use kurbo::{BezPath, Circle, ParamCurve, ParamCurveDeriv, Point, Rect, Shape};
 use kurbo_se::{StrokeAlignment, StrokeStyle, stroke_aligned};
 
 fn grid_check(
@@ -236,6 +236,45 @@ fn open_loop_curve_no_cancellation() {
     }
 }
 
+/// The same curve's loop, stroked inside and outside: each band must stay
+/// on its own side of the loop. The loop's fill is probed just below its
+/// top, where the curve is level. A level ray from there grazes the top,
+/// and kurbo's winding count can take that near double root for no
+/// crossing. The loop then reads as unfilled, and an outside stroke goes
+/// into it instead of round it.
+#[test]
+fn open_loop_curve_bands_the_loop_on_its_own_side() {
+    let c = kurbo::CubicBez::new((20.0, 150.0), (200.0, 20.0), (0.0, 20.0), (180.0, 150.0));
+    let mut p = BezPath::new();
+    p.move_to(c.p0);
+    p.curve_to(c.p1, c.p2, c.p3);
+    // The loop runs between the parameters where the curve crosses itself.
+    let (t1, t2) = (0.301_32, 0.698_68);
+    let mut lobe = BezPath::new();
+    lobe.move_to(c.eval(t1));
+    for i in 1..=200 {
+        lobe.line_to(c.eval(t1 + (t2 - t1) * i as f64 / 200.0));
+    }
+    lobe.close_path();
+    for alignment in [StrokeAlignment::Inside, StrokeAlignment::Outside] {
+        let style = StrokeStyle::new(12.0).with_alignment(alignment);
+        let out = stroke_aligned(&p, &style, 1e-3);
+        for i in 5..=95 {
+            let t = t1 + (t2 - t1) * i as f64 / 100.0;
+            let d = c.deriv().eval(t).to_vec2().normalize();
+            for off in [4.0, -4.0] {
+                let q = c.eval(t) + kurbo::Vec2::new(-d.y, d.x) * off;
+                let want = (lobe.winding(q) != 0) == (alignment == StrokeAlignment::Inside);
+                assert_eq!(
+                    out.winding(q) != 0,
+                    want,
+                    "{alignment:?}: at {q:?}, {off} off the loop at t = {t:.3}"
+                );
+            }
+        }
+    }
+}
+
 /// Degenerate-width regression (sandbox session, 2026-08-20): at the exact
 /// width where an offset degenerates, the pipeline used to shred it into
 /// thousands of fuzz segments (donut at half its ring thickness) or spend
@@ -389,8 +428,9 @@ fn mixed_open_closed_outside_extreme() {
 /// The star regressed here at w ≈ 79–95 while 60 and 100 were fine: the
 /// distance prune exempted join geometry outright, so at extreme widths the
 /// enormous join fans at the star's reflex corners survived inside the fill
-/// and stitched into a bogus erosion loop. The exemption is now bounded by
-/// the join's real reach (`cos(φ/2)` for a bevel chord).
+/// and stitched into a bogus erosion loop. The prune now tests the band
+/// with its styled joins, so join geometry counts only as far as the join
+/// reaches. See `Corner` in `region.rs`.
 #[test]
 fn extreme_inside_saturation_is_monotone() {
     let mut star = BezPath::new();
@@ -424,6 +464,16 @@ fn extreme_inside_saturation_is_monotone() {
         ("circle", &circle, 105.0),
     ] {
         for join in [kurbo::Join::Miter, kurbo::Join::Round, kurbo::Join::Bevel] {
+            // A bevel reaches less far into a concave corner than the round
+            // join the weights above assume. The star's inner corners turn
+            // by 69.7°, so the bevel chord sits w·cos(34.83°) ≈ 0.82·w from
+            // the corner. A bevelled band covers the star's middle only from
+            // w ≈ 48.7 and leaves a small pentagon open between 40 and that.
+            let saturated_at = if name == "star" && join == kurbo::Join::Bevel {
+                49.0
+            } else {
+                saturated_at
+            };
             for w in [
                 saturated_at,
                 saturated_at * 1.5,

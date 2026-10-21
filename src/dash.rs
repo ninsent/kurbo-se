@@ -34,6 +34,25 @@ pub(crate) struct DashClip<'a> {
     pub accuracy: f64,
 }
 
+/// Where a piece sits in its subpath's dash pattern.
+///
+/// An unsplit subpath uses `Phase::default()`. A piece split at
+/// self-intersections copies the fields of its
+/// [`SplitArc`](crate::split::SplitArc).
+#[derive(Copy, Clone, Default)]
+pub(crate) struct Phase {
+    /// Arc length where the piece starts in the original subpath. It keeps
+    /// the pattern continuous across pieces.
+    pub s0: f64,
+    /// Index of the piece's first element after the start point of its
+    /// closed subpath, where the pattern restarts. See
+    /// [`SplitArc::seam`](crate::split::SplitArc::seam).
+    pub seam: Option<usize>,
+    /// Whether another piece picks up the pattern where this one ends. See
+    /// [`SplitArc::shares_end`](crate::split::SplitArc::shares_end).
+    pub shares_end: bool,
+}
+
 /// Arc-length accuracy, matching kurbo's internal `DASH_ACCURACY`.
 const DASH_ACCURACY: f64 = 1e-6;
 
@@ -94,15 +113,14 @@ pub(crate) fn sanitize(dash: &DashStyle) -> Option<SanitizedDash<'_>> {
 /// `None` when this piece has no true endpoint, as for an arc cut at a
 /// crossing. Every other dash edge gets `dash.cap`.
 ///
-/// `phase_shift` is the piece's arc-length start in the original subpath,
-/// which keeps the pattern phase continuous across split pieces.
+/// `phase` places a split piece in its original subpath's pattern.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn expand_dashed_subpath(
     subpath: &[PathEl],
     closed: bool,
     dash: &SanitizedDash<'_>,
     params: BandParams<'_>,
-    phase_shift: f64,
+    phase: Phase,
     true_start: Option<Point>,
     true_end: Option<Point>,
     clip: Option<DashClip<'_>>,
@@ -113,7 +131,26 @@ pub(crate) fn expand_dashed_subpath(
     band_buf: &mut BezPath,
     out: &mut BezPath,
 ) {
-    let offset = dash.offset - phase_shift;
+    // kurbo reads the offset like SVG's `stroke-dashoffset`: at arc length
+    // `s` the pattern is at `offset + s`. So a piece that starts `s0` into
+    // the original subpath starts `offset + s0` into the pattern.
+    let offset = dash.offset + phase.s0;
+
+    // kurbo restarts the pattern at the start point of a closed subpath. A
+    // piece that runs through that point is dashed in two parts: the part
+    // before it continues from `s0`, the part after starts again at arc
+    // length 0. The dash that crosses the point is joined back into one
+    // further down, as kurbo's seam-merge does.
+    let (before, after) = match phase.seam {
+        Some(k) if k >= 2 && k < subpath.len() => {
+            let seam_pt = subpath[k - 1].end_point().unwrap_or(Point::ORIGIN);
+            let mut after = Vec::with_capacity(subpath.len() - k + 1);
+            after.push(PathEl::MoveTo(seam_pt));
+            after.extend_from_slice(&subpath[k..]);
+            (&subpath[..k], Some((after, seam_pt)))
+        }
+        _ => (subpath, None),
+    };
 
     // Zero-length dashes become dots, synthesized separately: the dash
     // stream represents them as degenerate pairs with no tangent.
@@ -123,30 +160,76 @@ pub(crate) fn expand_dashed_subpath(
     // in favour of the synthesized dot at that position.
     let mut tiny_group_threshold = 0.0;
     if dash.has_zero_dashes && dash.cap != Cap::Butt {
-        let total: f64 = kurbo::segments(non_degenerate(subpath))
-            .map(|seg| math::arclen(&seg, DASH_ACCURACY))
-            .sum();
+        let length = |els: &[PathEl]| -> f64 {
+            kurbo::segments(non_degenerate(els))
+                .map(|seg| math::arclen(&seg, DASH_ACCURACY))
+                .sum()
+        };
+        let before_len = length(before);
+        let after_len = after.as_ref().map_or(0.0, |(els, _)| length(els));
+        // A dot exactly at the end of a part belongs to whatever starts
+        // there: the start of an unsplit closed contour, the part after the
+        // start point, or the next piece at a crossing. Only the true end of
+        // an open path draws one.
+        let dots = |buf: &mut BezPath| {
+            let before_shares_end = closed || after.is_some() || phase.shares_end;
+            synthesize_dots(
+                before,
+                before_shares_end,
+                dash,
+                &params,
+                offset,
+                before_len,
+                buf,
+            );
+            if let Some((els, _)) = &after {
+                synthesize_dots(
+                    els,
+                    phase.shares_end,
+                    dash,
+                    &params,
+                    dash.offset,
+                    after_len,
+                    buf,
+                );
+            }
+        };
         match clip {
             Some(c) => {
                 band_buf.truncate(0);
-                synthesize_dots(subpath, closed, dash, &params, offset, total, band_buf);
+                dots(band_buf);
                 crate::clip::clip_band(band_buf, c.source, c.keep_inside, c.accuracy, out);
                 band_buf.truncate(0);
             }
-            None => synthesize_dots(subpath, closed, dash, &params, offset, total, out),
+            None => dots(out),
         }
-        tiny_group_threshold = 1e-6 * total.max(1.0);
+        tiny_group_threshold = 1e-6 * (before_len + after_len).max(1.0);
     }
+
+    // The pipeline's resolution along this subpath. A dash shorter than
+    // this is rounding noise: when the phase lands a hair past a pattern
+    // boundary at a segment end, kurbo starts a dash about 1e-14 long, and
+    // its caps would draw a stray dot. Also, kurbo ends a dash on a line by
+    // evaluating the segment at `t = 1`, which can land an ulp short of the
+    // subpath's end point. A dash edge this close to a true endpoint counts
+    // as that endpoint and keeps its cap.
+    let noise = crate::normalize::RESOLUTION * crate::normalize::extent(subpath);
+    let is_true_end = |pt: Option<Point>, end: Option<Point>| match (pt, end) {
+        (Some(pt), Some(end)) => (pt - end).hypot() <= noise,
+        _ => false,
+    };
 
     // Stream the dashed elements, grouping per dash; each dash starts with
     // a MoveTo. kurbo may emit the zero-length dash last, out of its
     // seam-merge stash, so caps are assigned geometrically rather than by
     // position in the stream.
     let mut flush = |group: &mut Vec<PathEl>| {
+        drop_unplaced(group);
         if group.is_empty() {
             return;
         }
-        if tiny_group_threshold > 0.0 && group_chord_len(group) < tiny_group_threshold {
+        let len = group_len(group);
+        if len <= noise || (tiny_group_threshold > 0.0 && len < tiny_group_threshold) {
             group.clear();
             return;
         }
@@ -162,12 +245,12 @@ pub(crate) fn expand_dashed_subpath(
                 _ => None,
             };
             let trailing = group.last().and_then(|el| el.end_point());
-            p.start_cap = if leading.is_some() && leading == true_start {
+            p.start_cap = if is_true_end(leading, true_start) {
                 params.start_cap
             } else {
                 dash.cap
             };
-            p.end_cap = if trailing.is_some() && trailing == true_end {
+            p.end_cap = if is_true_end(trailing, true_end) {
                 params.end_cap
             } else {
                 dash.cap
@@ -194,13 +277,97 @@ pub(crate) fn expand_dashed_subpath(
     };
 
     group.clear();
-    for el in kurbo::dash(non_degenerate(subpath), offset, dash.pattern) {
-        if matches!(el, PathEl::MoveTo(_)) {
-            flush(group);
+    let Some((after, seam_pt)) = after else {
+        for el in kurbo::dash(non_degenerate(subpath), offset, dash.pattern) {
+            if matches!(el, PathEl::MoveTo(_)) {
+                flush(group);
+            }
+            group.push(el);
         }
-        group.push(el);
+        flush(group);
+        return;
+    };
+
+    // Only pieces of closed self-intersecting subpaths get here, so
+    // collecting the dashes of both parts first costs little.
+    let mut before_dashes = dash_groups(before, offset, dash.pattern);
+    let mut after_dashes = dash_groups(&after, dash.offset, dash.pattern);
+    // The dash running into the start point can end an ulp off it, as
+    // above, so it is matched within `noise`. The dash running out of it
+    // starts exactly there, with that point as its `MoveTo`.
+    let into = before_dashes.iter().position(|g| {
+        g.last()
+            .and_then(|el| el.end_point())
+            .is_some_and(|p| (p - seam_pt).hypot() <= noise)
+    });
+    // kurbo joins the dash running into the start point only to the dash it
+    // stashed there. That dash exists only when the pattern is on at the
+    // start, and on an open run kurbo emits it last. Another dash can also
+    // start there, when the offset sits exactly on the end of a gap or
+    // after a gap of length zero. kurbo keeps that one separate.
+    let out_of = starts_on(dash)
+        .then(|| {
+            after_dashes
+                .iter()
+                .rposition(|g| g.first() == Some(&PathEl::MoveTo(seam_pt)))
+        })
+        .flatten();
+    if let (Some(i), Some(j)) = (into, out_of) {
+        let continued = after_dashes.remove(j);
+        before_dashes[i].extend(continued.into_iter().skip(1));
     }
-    flush(group);
+    for mut g in before_dashes.into_iter().chain(after_dashes) {
+        flush(&mut g);
+    }
+}
+
+/// The dashes of `els` as separate element runs, each led by its `MoveTo`.
+fn dash_groups(els: &[PathEl], offset: f64, pattern: &[f64]) -> Vec<Vec<PathEl>> {
+    let mut groups: Vec<Vec<PathEl>> = Vec::new();
+    for el in kurbo::dash(non_degenerate(els), offset, pattern) {
+        match (el, groups.last_mut()) {
+            (PathEl::MoveTo(_), _) | (_, None) => groups.push(alloc::vec![el]),
+            (_, Some(g)) => g.push(el),
+        }
+    }
+    for g in &mut groups {
+        drop_unplaced(g);
+    }
+    groups.retain(|g| !g.is_empty());
+    groups
+}
+
+/// Whether the pattern is on at the start of the path. If it is,
+/// `kurbo::dash` begins with a dash it stashes for the seam. This copies
+/// kurbo's phase search: a dash whose remaining length comes out exactly
+/// zero still counts as on.
+fn starts_on(dash: &SanitizedDash<'_>) -> bool {
+    let pattern = dash.pattern;
+    let period: f64 = pattern.iter().sum::<f64>() * if pattern.len() % 2 == 1 { 2.0 } else { 1.0 };
+    let mut ix = 0;
+    let mut remaining = pattern[0] - math::rem_euclid(dash.offset, period);
+    let mut on = true;
+    while remaining < 0.0 {
+        ix = (ix + 1) % pattern.len();
+        remaining += pattern[ix];
+        on = !on;
+    }
+    on
+}
+
+/// Drop the elements `kurbo::dash` could not place.
+///
+/// When a zero-length pattern entry lands exactly on a segment end,
+/// rounding can leave a sliver of the segment after its parameter has
+/// already reached 1. kurbo then measures the empty rest as `0 / 0`, and
+/// the element comes out `NaN`. It covers no distance, so it is dropped. A
+/// dash whose `MoveTo` is `NaN` is dropped whole, so it does not join the
+/// dash before it.
+fn drop_unplaced(group: &mut Vec<PathEl>) {
+    group.retain(|el| el.is_finite());
+    if !matches!(group.first(), Some(PathEl::MoveTo(_))) {
+        group.clear();
+    }
 }
 
 /// Drop drawing elements that cover no distance.
@@ -234,14 +401,26 @@ fn non_degenerate(els: &[PathEl]) -> impl Iterator<Item = PathEl> + '_ {
     })
 }
 
-/// Total straight-line length of a dash group's elements. A cheap lower
-/// bound on its arc length, used only to identify zero dashes that
-/// floating-point noise has fattened.
-fn group_chord_len(group: &[PathEl]) -> f64 {
+/// Length of a dash group's control polygon. It is never less than the arc
+/// length, and zero only for a dash that covers no distance. Chords between
+/// end points are not enough: a dash that runs once around a loop cut off
+/// at a crossing can be a single curve that ends where it starts, so its
+/// chord is zero.
+fn group_len(group: &[PathEl]) -> f64 {
     let mut len = 0.0;
     let mut last: Option<Point> = None;
     for el in group {
-        if let Some(p) = el.end_point() {
+        let points: &[Point] = match el {
+            PathEl::MoveTo(p) => {
+                last = Some(*p);
+                continue;
+            }
+            PathEl::LineTo(p) => &[*p],
+            PathEl::QuadTo(p1, p2) => &[*p1, *p2],
+            PathEl::CurveTo(p1, p2, p3) => &[*p1, *p2, *p3],
+            PathEl::ClosePath => continue,
+        };
+        for &p in points {
             if let Some(prev) = last {
                 len += (p - prev).hypot();
             }
@@ -260,7 +439,7 @@ fn group_chord_len(group: &[PathEl]) -> f64 {
 /// needed to offset the band midpoint and orient square dots.
 fn synthesize_dots(
     subpath: &[PathEl],
-    closed: bool,
+    shares_end: bool,
     dash: &SanitizedDash<'_>,
     params: &BandParams<'_>,
     effective_offset: f64,
@@ -291,8 +470,11 @@ fn synthesize_dots(
         let len = entry(i);
         let is_on = i % 2 == 0;
         if is_on && len == 0.0 && cursor >= 0.0 {
-            // On a closed contour, position `total` coincides with 0.
-            if !(closed && cursor == total) {
+            // A dot at position `total` belongs to whatever starts there: on
+            // a closed contour, position 0. The test allows for rounding.
+            // The cursor and `total` sum different lengths, so a dot a hair
+            // short of the end is still the dot at the shared point.
+            if !(shares_end && cursor >= total - 1e-9 * total.max(1.0)) {
                 positions.push(cursor);
             }
         }

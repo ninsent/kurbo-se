@@ -24,7 +24,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 
-use kurbo::{BezPath, ParamCurve, ParamCurveExtrema, PathEl, PathSeg, Point, Rect};
+use kurbo::{BezPath, ParamCurve, ParamCurveExtrema, PathEl, PathSeg, Point, Rect, Vec2};
 
 /// Parametric epsilon for treating a hit as an endpoint touch.
 pub(crate) const T_EPS: f64 = 1e-6;
@@ -53,6 +53,16 @@ pub(crate) struct SplitArc {
     pub els: BezPath,
     pub s0: f64,
     pub piece_ix: usize,
+    /// Set on the arc of a closed subpath that runs through its start
+    /// point: the index into `els` of the first element after that point.
+    /// kurbo restarts the dash pattern at the start point, so the elements
+    /// from here on are dashed from arc length `0` rather than from `s0`.
+    pub seam: Option<usize>,
+    /// Whether another arc picks up the pattern where this one ends: at a
+    /// crossing, or at the start point of a closed subpath. A zero-length
+    /// dash that lands exactly there belongs to that other arc, as it would
+    /// on an unsplit path, so this arc does not draw its dot.
+    pub shares_end: bool,
 }
 
 pub(crate) struct SplitResult {
@@ -185,6 +195,7 @@ pub(crate) fn split_self_intersections(
         els: BezPath,
         s0: f64,
         end_crossing: Option<usize>,
+        seam: Option<usize>,
     }
     let mut arcs: Vec<Arc> = Vec::new();
     let mut cur = BezPath::new();
@@ -205,8 +216,12 @@ pub(crate) fn split_self_intersections(
                 els: core::mem::take(&mut cur),
                 s0: cur_s0,
                 end_crossing: Some(c.crossing),
+                seam: None,
             });
-            cur_s0 = s + seg_len * t; // arc length approximated by parameter share
+            // Measured, not `seg_len * t`: arc length is proportional to
+            // the parameter only on a line. On a looping cubic the
+            // difference can shift the dash pattern by several units.
+            cur_s0 = s + crate::math::arclen(&seg.subsegment(0.0..t), ARCLEN_ACC);
             cur = BezPath::new();
             cur.move_to(seg.eval(t));
             t0 = t;
@@ -224,6 +239,7 @@ pub(crate) fn split_self_intersections(
         els: cur,
         s0: cur_s0,
         end_crossing: None,
+        seam: None,
     });
 
     // First arc may lack its MoveTo (starts at path start).
@@ -238,8 +254,9 @@ pub(crate) fn split_self_intersections(
     }
 
     // For a closed subpath the seam is not a cut, so merge the trailing arc
-    // into the leading one. They are contiguous through the seam, and the
-    // phase continues past the total length.
+    // into the leading one. They are contiguous through the seam. The merged
+    // arc records where the seam falls, because kurbo restarts the dash
+    // phase there, as `SplitArc::seam` explains.
     if closed && arcs.len() >= 2 {
         if arcs.last().unwrap().els.elements().len() < 2 {
             // A cut landed exactly on the seam; the stub carries nothing.
@@ -248,10 +265,13 @@ pub(crate) fn split_self_intersections(
             let last = arcs.pop().unwrap();
             let first_s0 = last.s0;
             let first = &mut arcs[0];
+            let seam = last.els.elements().len();
+            let past_seam = first.els.elements().len() >= 2;
             let mut merged = last.els;
             merged.extend(first.els.iter().skip(1)); // drop first's MoveTo
             first.els = merged;
             first.s0 = first_s0;
+            first.seam = past_seam.then_some(seam);
             // its end_crossing stays (the crossing that closed arc 0)
         }
     }
@@ -327,6 +347,8 @@ pub(crate) fn split_self_intersections(
             els: arc.els,
             s0: arc.s0,
             piece_ix: piece_of_arc[aix],
+            seam: arc.seam,
+            shares_end: closed || arc.end_crossing.is_some(),
         });
     }
     Some(out)
@@ -366,7 +388,7 @@ pub(crate) fn segment_pair_params(
         if next { ADJ_TRIM } else { 0.0 },
         if wrap { 1.0 - ADJ_TRIM } else { 1.0 },
     );
-    let mut hits = Vec::new();
+    let mut hits: Vec<Hit> = Vec::new();
     let mut budget = SEARCH_BUDGET;
     if next || wrap {
         let a_sub = a.subsegment(ar.0..ar.1);
@@ -384,8 +406,12 @@ pub(crate) fn segment_pair_params(
     } else {
         recurse(a, ar, b, br, accuracy.max(1e-9), 0, &mut hits, &mut budget);
     }
-    dedupe(&mut hits);
-    hits
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let mut out = polish_hits(a, b, hits, false, next, wrap);
+    dedupe(&mut out);
+    out
 }
 
 /// Subdivide a segment at the given parameters, which are sorted and
@@ -461,7 +487,7 @@ fn seg_self_intersections(seg: &PathSeg, accuracy: f64) -> Vec<(f64, f64)> {
     bounds.push(0.0);
     bounds.extend(ts);
     bounds.push(1.0);
-    let mut hits = Vec::new();
+    let mut hits: Vec<Hit> = Vec::new();
     let mut budget = SEARCH_BUDGET;
     for i in 0..bounds.len() - 1 {
         for j in (i + 1)..bounds.len() - 1 {
@@ -486,13 +512,131 @@ fn seg_self_intersections(seg: &PathSeg, accuracy: f64) -> Vec<(f64, f64)> {
             );
         }
     }
-    dedupe(&mut hits);
-    hits
+    if hits.is_empty() {
+        return Vec::new();
+    }
+    let mut out = polish_hits(seg, seg, hits, true, false, false);
+    dedupe(&mut out);
+    out
 }
 
 fn dedupe(hits: &mut Vec<(f64, f64)>) {
     hits.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.total_cmp(&y.1)));
     hits.dedup_by(|a, b| (a.0 - b.0).abs() < DEDUP_EPS && (a.1 - b.1).abs() < DEDUP_EPS);
+}
+
+/// Crossings at a smaller angle than this, as a sine, are not polished.
+const MIN_POLISH_SINE: f64 = 1e-3;
+
+/// A crossing found by [`recurse`]: its parameter on each segment, and the
+/// parameter ranges of the two flat pieces it was found between.
+#[derive(Copy, Clone)]
+struct Hit {
+    ta: f64,
+    tb: f64,
+    ar: (f64, f64),
+    br: (f64, f64),
+}
+
+/// Move each crossing that the search found between `a` and `b` onto the
+/// true crossing.
+///
+/// The search stops once both pieces are flat to within its accuracy. It
+/// then intersects their chords and reads the result back as a parameter
+/// along each piece. When the parameter runs unevenly along a curve, as on
+/// a cubic with a control point bunched at one end, that lands well away
+/// from the crossing: 11 units on a notch of Impact's `w` at accuracy 0.25.
+/// The pieces cut there then do not meet where the curves do, and anything
+/// probed or stitched at the cut reads the wrong side.
+///
+/// A polished crossing is kept only near the flat pieces it was found
+/// between, within one piece length on either side, since that is where
+/// the search placed it. Near tangency the curves stay close over a long
+/// stretch, and the exact crossing can lie far along it or be a different
+/// crossing altogether. It is also dropped when it collapses onto a point
+/// that is no crossing. With `same` that is a segment meeting itself at
+/// one parameter. With `next` or `wrap` it is two adjacent segments
+/// meeting at their shared end, as in [`segment_pair_params`]. Whenever
+/// the polished crossing is dropped, the search's own estimate is kept.
+fn polish_hits(
+    a: &PathSeg,
+    b: &PathSeg,
+    hits: Vec<Hit>,
+    same: bool,
+    next: bool,
+    wrap: bool,
+) -> Vec<(f64, f64)> {
+    let near = |t: f64, (lo, hi): (f64, f64)| {
+        let m = hi - lo;
+        (lo - m..=hi + m).contains(&t)
+    };
+    let at_end = |t: f64| !(T_EPS..=1.0 - T_EPS).contains(&t);
+    hits.into_iter()
+        .map(|h| {
+            // Where both strands end, the touch is a joint. Nothing
+            // downstream cuts there, and a smooth offset reports dozens
+            // of them.
+            if at_end(h.ta) && at_end(h.tb) {
+                return (h.ta, h.tb);
+            }
+            let (pa, pb) = polish_crossing(a, h.ta, b, h.tb);
+            let collapsed = (same && (pa - pb).abs() < ADJ_TRIM)
+                || (next && pa > 1.0 - ADJ_TRIM && pb < ADJ_TRIM)
+                || (wrap && pa < ADJ_TRIM && pb > 1.0 - ADJ_TRIM);
+            if near(pa, h.ar) && near(pb, h.br) && !collapsed {
+                (pa, pb)
+            } else {
+                (h.ta, h.tb)
+            }
+        })
+        .collect()
+}
+
+/// Run up to eight Newton steps on `a(ta) = b(tb)` from the given
+/// parameters. Stop before the first step that would not bring the two
+/// points closer.
+///
+/// A crossing within a thousandth of a radian of tangency is left as it
+/// is. There the curves run together over a stretch, every point of which
+/// is as good a crossing as any other, and Newton would slide along it as
+/// far as rounding takes it.
+pub(crate) fn polish_crossing(a: &PathSeg, ta: f64, b: &PathSeg, tb: f64) -> (f64, f64) {
+    let (da, db) = (deriv(a, ta), deriv(b, tb));
+    if db.cross(da).abs() < MIN_POLISH_SINE * da.hypot() * db.hypot() {
+        return (ta, tb);
+    }
+    let (mut ta, mut tb) = (ta, tb);
+    let mut gap = (a.eval(ta) - b.eval(tb)).hypot2();
+    for _ in 0..8 {
+        if gap == 0.0 {
+            break;
+        }
+        let (da, db) = (deriv(a, ta), deriv(b, tb));
+        let det = db.cross(da);
+        if det == 0.0 {
+            break;
+        }
+        // Solve `da·δa − db·δb = b(tb) − a(ta)`.
+        let r = b.eval(tb) - a.eval(ta);
+        let na = (ta + db.cross(r) / det).clamp(0.0, 1.0);
+        let nb = (tb + da.cross(r) / det).clamp(0.0, 1.0);
+        let next = (a.eval(na) - b.eval(nb)).hypot2();
+        if next.is_nan() || next >= gap {
+            break;
+        }
+        (ta, tb, gap) = (na, nb, next);
+    }
+    (ta, tb)
+}
+
+/// The derivative of `seg` at `t`.
+pub(crate) fn deriv(seg: &PathSeg, t: f64) -> Vec2 {
+    use kurbo::ParamCurveDeriv;
+    match seg {
+        PathSeg::Line(l) => l.p1 - l.p0,
+        PathSeg::Quad(q) => q.deriv().eval(t).to_vec2(),
+        PathSeg::Cubic(c) => c.deriv().eval(t).to_vec2(),
+    }
 }
 
 const MAX_DEPTH: u32 = 28;
@@ -522,7 +666,7 @@ fn recurse(
     br: (f64, f64),
     accuracy: f64,
     depth: u32,
-    out: &mut Vec<(f64, f64)>,
+    out: &mut Vec<Hit>,
     budget: &mut u32,
 ) {
     if *budget == 0 {
@@ -557,7 +701,7 @@ fn recurse(
         }
         let ta = ar.0 + s.clamp(0.0, 1.0) * (ar.1 - ar.0);
         let tb = br.0 + t.clamp(0.0, 1.0) * (br.1 - br.0);
-        out.push((ta, tb));
+        out.push(Hit { ta, tb, ar, br });
         return;
     }
     // Subdivide the less flat one, or both when they are comparable.
@@ -579,7 +723,55 @@ fn recurse(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kurbo::Shape;
+    use kurbo::{CubicBez, Shape};
+
+    /// Two nearly straight cubics cross at about 20°, each with a control
+    /// point bunched at its start. At accuracy 4 they are already flat, so
+    /// the search intersects their chords, and the chord fraction read back
+    /// as a parameter lands far along the curve from the crossing. At every
+    /// accuracy tested, the reported crossing must lie on both curves.
+    #[test]
+    fn crossings_land_on_both_curves() {
+        let a = PathSeg::Cubic(CubicBez::new(
+            (0.0, 0.0),
+            (0.05, 0.5),
+            (3.0, 30.0),
+            (18.0, 100.0),
+        ));
+        let b = PathSeg::Cubic(CubicBez::new(
+            (14.0, 0.0),
+            (13.95, 0.5),
+            (11.0, 30.0),
+            (-4.0, 100.0),
+        ));
+        let mut raw = Vec::new();
+        let mut budget = SEARCH_BUDGET;
+        recurse(
+            &a,
+            (0.0, 1.0),
+            &b,
+            (0.0, 1.0),
+            4.0,
+            0,
+            &mut raw,
+            &mut budget,
+        );
+        let estimate = raw.iter().map(|h| (a.eval(h.ta) - b.eval(h.tb)).hypot());
+        assert!(
+            estimate.fold(0.0, f64::max) > 1.0,
+            "the search's own estimate should miss here"
+        );
+        for accuracy in [4.0, 0.25, 1e-3] {
+            let hits = segment_pair_params(&a, &b, false, false, accuracy);
+            assert_eq!(hits.len(), 1, "accuracy {accuracy}: {hits:?}");
+            let (ta, tb) = hits[0];
+            let gap = (a.eval(ta) - b.eval(tb)).hypot();
+            assert!(
+                gap < 1e-9,
+                "accuracy {accuracy}: cut {gap} off the crossing"
+            );
+        }
+    }
 
     fn bowtie() -> BezPath {
         let mut p = BezPath::new();

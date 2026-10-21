@@ -38,6 +38,23 @@ fn star() -> BezPath {
     p
 }
 
+/// `2 * teeth` vertices alternating between `r_tip` and `r_root`.
+fn gear(teeth: usize, c: f64, r_tip: f64, r_root: f64) -> BezPath {
+    let mut p = BezPath::new();
+    for i in 0..(teeth * 2) {
+        let r = if i % 2 == 0 { r_tip } else { r_root };
+        let a = std::f64::consts::PI * (i as f64) / teeth as f64;
+        let pt = (c + r * a.cos(), c + r * a.sin());
+        if i == 0 {
+            p.move_to(pt);
+        } else {
+            p.line_to(pt);
+        }
+    }
+    p.close_path();
+    p
+}
+
 fn donut() -> BezPath {
     let mut p = Circle::new((130.0, 130.0), 100.0).to_path(1e-9);
     p.extend(
@@ -54,6 +71,7 @@ fn bench_expand(c: &mut Criterion) {
     let wavy40 = wavy(40);
     let star = star();
     let donut = donut();
+    let gear = gear(750, 400.0, 300.0, 290.0);
     let tol = 0.25; // display tolerance
 
     let solid_inside = StrokeStyle::new(8.0).with_alignment(StrokeAlignment::Inside);
@@ -78,6 +96,17 @@ fn bench_expand(c: &mut Criterion) {
     // Two contours through the region pipeline (hole-aware erosion).
     g.bench_function("donut/inside/solid", |b| {
         b.iter(|| black_box(stroke_aligned(black_box(&donut), &solid_inside, tol)));
+    });
+    // 1500 segments, with teeth closer together than the width. The erosion
+    // breaks into thousands of pieces, which stresses cutting, pruning and
+    // stitching. Run with round joins and with the default miter, which
+    // falls back to a bevel at corners this sharp.
+    let gear_round = solid_inside.clone().with_join(kurbo_se::Join::Round);
+    g.bench_function("gear1500/inside/round", |b| {
+        b.iter(|| black_box(stroke_aligned(black_box(&gear), &gear_round, tol)));
+    });
+    g.bench_function("gear1500/inside/solid", |b| {
+        b.iter(|| black_box(stroke_aligned(black_box(&gear), &solid_inside, tol)));
     });
     g.bench_function("wavy40/inside/solid", |b| {
         b.iter(|| black_box(stroke_aligned(black_box(&wavy40), &solid_inside, tol)));

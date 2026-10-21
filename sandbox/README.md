@@ -61,3 +61,33 @@ concave star; a donut (hole with opposite winding); a self-intersecting
 bowtie; a figure-eight; zero-length segments; a smooth spiral; a
 multi-subpath mix (which also demonstrates dash phase); and a sharp wedge
 that exercises the inner-side clip.
+
+## Text
+
+The last gallery entry, "Text (type your own)", strokes your own text
+and updates as you type. The limit is 32 characters: the input stops
+there, and the wasm side cuts anything longer, URL params included.
+[parley](https://github.com/linebender/parley) lays the text out on one
+line in Inter Regular. The font is bundled in `wasm/fonts`, with its SIL
+Open Font License in `OFL.txt`. Wasm has no system fonts, so a character
+Inter lacks shows as its missing-glyph box. skrifa draws each glyph
+outline into a kurbo path, flipped to y-down. Holes wind opposite to
+their outer contour. Size sets the font size in px.
+
+Union is on by default. It merges the glyph outlines under the nonzero
+rule before stroking. Without it, every contour edge is stroked,
+including edges that run through the inside of a letter. Outlines
+overlap in composite accents like ą, Ø and Ғ, in glyphs built from
+overlapping contours like Inter's k, and where letters touch. A single
+contour can also cross itself, like Inter's e and &: the e's bar runs on
+into the bowl.
+
+The union is hand-written in `wasm/src/union.rs` and keeps the curves.
+It cuts the contours wherever they cross, each other or themselves, and
+polishes each crossing with Newton's method. Then it keeps the pieces
+with fill on exactly one side and stitches them back into loops. A
+contour that nothing crosses is kept or dropped as a whole.
+
+The text goes in the URL like the other settings: `?text=Hello`,
+`textSize=160`, `union=0`. `shape=text` picks the text source, and so
+does a `text` param when there is no `shape` param.

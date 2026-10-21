@@ -2,6 +2,9 @@
 //! and debug JSON out. Renderer-free on purpose; the frontend draws plain
 //! SVG.
 
+use std::cell::RefCell;
+use std::sync::Arc;
+
 use kurbo_se::kurbo::{
     self, BezPath, Cap, Circle, Join, ParamCurve, PathEl, PathSeg, Rect, Shape, Vec2,
 };
@@ -9,8 +12,15 @@ use kurbo_se::{
     DashStyle, StrokeAlignment, StrokeSide, StrokeStyle, analyze_subpaths, miter_angle_to_limit,
     stroke_aligned,
 };
+use parley::fontique::{Blob, Collection, CollectionOptions, SourceCache};
+use parley::{FontContext, FontFamily, Layout, LayoutContext, PositionedLayoutItem, StyleProperty};
 use serde::{Deserialize, Serialize};
+use skrifa::instance::{LocationRef, NormalizedCoord, Size};
+use skrifa::outline::{DrawSettings, OutlinePen};
+use skrifa::{FontRef, GlyphId, MetadataProvider};
 use wasm_bindgen::prelude::*;
+
+mod union;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -422,4 +432,184 @@ pub fn gallery() -> String {
     items.push(entry("Sharp wedge (inner clip)", p));
 
     serde_json::to_string(&items).unwrap()
+}
+
+// ---------- text source ----------
+
+/// Most characters the text source lays out, counted as Unicode scalar
+/// values. The panel's input stops at the same number of UTF-16 units,
+/// so it never goes past this limit. This is the backstop for URL params
+/// and direct calls.
+const TEXT_MAX_CHARS: usize = 32;
+
+/// Crossing-search accuracy for the glyph union, as a fraction of the font
+/// size.
+const UNION_ACCURACY_EM: f64 = 1e-6;
+
+/// Inter Regular, under the SIL Open Font License 1.1 in `fonts/OFL.txt`.
+/// Wasm has no system fonts, so this is the only font parley can pick.
+static INTER: &[u8] = include_bytes!("../fonts/Inter-Regular.ttf");
+
+/// Parley's font database and layout scratch space, built once.
+struct TextCx {
+    font_cx: FontContext,
+    layout_cx: LayoutContext<()>,
+    family: String,
+}
+
+impl TextCx {
+    fn new() -> Self {
+        let mut font_cx = FontContext {
+            collection: Collection::new(CollectionOptions {
+                shared: false,
+                system_fonts: false,
+            }),
+            source_cache: SourceCache::default(),
+        };
+        let families = font_cx
+            .collection
+            .register_fonts(Blob::new(Arc::new(INTER)), None);
+        let family = families
+            .first()
+            .and_then(|(id, _)| font_cx.collection.family_name(*id))
+            .unwrap_or("Inter")
+            .to_owned();
+        TextCx {
+            font_cx,
+            layout_cx: LayoutContext::new(),
+            family,
+        }
+    }
+
+    /// Lays `text` out on one line at `size` px and collects every glyph's
+    /// outline into one path. The path is in y-down layout space, with the
+    /// first line's top at y = 0.
+    fn outline(&mut self, text: &str, size: f32) -> BezPath {
+        let mut builder = self
+            .layout_cx
+            .ranged_builder(&mut self.font_cx, text, 1.0, false);
+        builder.push_default(StyleProperty::FontSize(size));
+        builder.push_default(FontFamily::named(&self.family));
+        let mut layout: Layout<()> = builder.build(text);
+        layout.break_all_lines(None);
+
+        let mut path = BezPath::new();
+        for line in layout.lines() {
+            for item in line.items() {
+                let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+                let run = glyph_run.run();
+                let font = run.font();
+                let Ok(font_ref) = FontRef::from_index(font.data.as_ref(), font.index) else {
+                    continue;
+                };
+                let outlines = font_ref.outline_glyphs();
+                let coords: Vec<NormalizedCoord> = run
+                    .normalized_coords()
+                    .iter()
+                    .map(|c| NormalizedCoord::from_bits(c.to_bits()))
+                    .collect();
+                for glyph in glyph_run.positioned_glyphs() {
+                    let Some(outline) = outlines.get(GlyphId::new(glyph.id)) else {
+                        continue;
+                    };
+                    let settings = DrawSettings::unhinted(
+                        Size::new(run.font_size()),
+                        LocationRef::new(&coords),
+                    );
+                    let mut pen = GlyphPen {
+                        path: &mut path,
+                        origin: (f64::from(glyph.x), f64::from(glyph.y)),
+                    };
+                    // A glyph that fails to draw is left out, like a
+                    // missing one.
+                    let _ = outline.draw(settings, &mut pen);
+                }
+            }
+        }
+        path
+    }
+}
+
+thread_local! {
+    static TEXT_CX: RefCell<TextCx> = RefCell::new(TextCx::new());
+}
+
+/// Appends one glyph's outline to a path. Font outlines are y-up around
+/// the glyph origin, so y is flipped. The flip reverses every contour,
+/// outer and hole alike, so holes still wind opposite to outer contours.
+/// The nonzero fill and the crate's hole detection rely on that.
+struct GlyphPen<'a> {
+    path: &'a mut BezPath,
+    origin: (f64, f64),
+}
+
+impl GlyphPen<'_> {
+    fn pt(&self, x: f32, y: f32) -> kurbo::Point {
+        kurbo::Point::new(self.origin.0 + f64::from(x), self.origin.1 - f64::from(y))
+    }
+}
+
+impl OutlinePen for GlyphPen<'_> {
+    fn move_to(&mut self, x: f32, y: f32) {
+        let p = self.pt(x, y);
+        self.path.move_to(p);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        let p = self.pt(x, y);
+        self.path.line_to(p);
+    }
+
+    fn quad_to(&mut self, cx0: f32, cy0: f32, x: f32, y: f32) {
+        let (c, p) = (self.pt(cx0, cy0), self.pt(x, y));
+        self.path.quad_to(c, p);
+    }
+
+    fn curve_to(&mut self, cx0: f32, cy0: f32, cx1: f32, cy1: f32, x: f32, y: f32) {
+        let (c0, c1, p) = (self.pt(cx0, cy0), self.pt(cx1, cy1), self.pt(x, y));
+        self.path.curve_to(c0, c1, p);
+    }
+
+    fn close(&mut self) {
+        self.path.close_path();
+    }
+}
+
+/// The text source's character limit. The panel's input uses the same
+/// number.
+#[wasm_bindgen]
+pub fn text_max_chars() -> usize {
+    TEXT_MAX_CHARS
+}
+
+/// Glyph outlines of `text`, laid out by parley at `size` px, as a gallery
+/// entry JSON object `{name, d, bbox}`. With `union`, overlapping contours
+/// merge into one outline that keeps the curves; see `union.rs`. Without
+/// it, the contours are the font's own, overlaps and all. Only the first
+/// `TEXT_MAX_CHARS` characters are used. Empty or all-whitespace text
+/// gives an empty `d` and a zero bbox.
+#[wasm_bindgen]
+pub fn text_outline(text: &str, size: f64, union: bool) -> String {
+    let text: String = text.chars().take(TEXT_MAX_CHARS).collect();
+    let size = if size.is_finite() {
+        size.clamp(1.0, 1000.0)
+    } else {
+        120.0
+    };
+    let mut path = TEXT_CX.with_borrow_mut(|cx| cx.outline(&text, size as f32));
+    if union {
+        path = union::union_nonzero(&path, size * UNION_ACCURACY_EM);
+    }
+    let out = if path.is_empty() {
+        GalleryEntry {
+            name: "Text".into(),
+            d: String::new(),
+            bbox: (0.0, 0.0, 0.0, 0.0),
+        }
+    } else {
+        entry("Text", path)
+    };
+    serde_json::to_string(&out).unwrap()
 }

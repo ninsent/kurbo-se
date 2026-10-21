@@ -245,7 +245,34 @@ fn clip_loop(
         }
     }
 
+    // Also cut the band where it crosses itself, so that each piece is
+    // either all band boundary or all inside the band: `band_boundary`
+    // judges a piece by its middle. Only a band that folds over itself has
+    // such crossings.
+    let n = lsegs.len();
+    let lboxes: Vec<Rect> = lsegs.iter().map(control_box).collect();
+    for i in 0..n {
+        if on_bnd[i] {
+            continue;
+        }
+        lcuts[i].extend(split::segment_self_intersection_params(&lsegs[i], accuracy));
+        for j in i + 1..n {
+            if on_bnd[j] || !overlaps(lboxes[i], lboxes[j], accuracy) {
+                continue;
+            }
+            let next = j == i + 1;
+            let wrap = i == 0 && j == n - 1;
+            for (ta, tb) in split::segment_pair_params(&lsegs[i], &lsegs[j], next, wrap, accuracy) {
+                lcuts[i].push(ta);
+                lcuts[j].push(tb);
+            }
+        }
+    }
+
     // --- classify ---
+    // How far beside a band piece to look for paint: far above rounding,
+    // far below any band worth drawing.
+    let probe = 1e-6 * lbb.size().max_side();
     let mut pieces: Vec<PathSeg> = Vec::new();
     for (li, ls) in lsegs.iter().enumerate() {
         if on_bnd[li] {
@@ -256,7 +283,7 @@ fn clip_loop(
         }
         for piece in split::subdivide_at(ls, &mut lcuts[li]) {
             if src.filled(piece.eval(0.5)) == keep_inside {
-                pieces.push(piece);
+                pieces.extend(band_boundary(l.elements(), piece, probe));
             }
         }
     }
@@ -265,7 +292,7 @@ fn clip_loop(
     for (ci, &si) in cand.iter().enumerate() {
         for piece in split::subdivide_at(&src.segs[si], &mut scuts[ci]) {
             let m = piece.eval(0.5);
-            if l.winding(m) == 0 {
+            if crate::orient::winding(l.elements(), m) == 0 {
                 continue;
             }
             // Skip the stretch the band already carries as its shared edge.
@@ -284,7 +311,7 @@ fn clip_loop(
 }
 
 /// Conservative box of a segment's control points.
-fn control_box(seg: &PathSeg) -> Rect {
+pub(crate) fn control_box(seg: &PathSeg) -> Rect {
     let pts: [Point; 4] = match seg {
         PathSeg::Line(l) => [l.p0, l.p1, l.p0, l.p1],
         PathSeg::Quad(q) => [q.p0, q.p1, q.p2, q.p2],
@@ -305,6 +332,32 @@ fn reverse(seg: PathSeg) -> PathSeg {
         PathSeg::Line(l) => PathSeg::Line(Line::new(l.p1, l.p0)),
         PathSeg::Quad(q) => PathSeg::Quad(QuadBez::new(q.p2, q.p1, q.p0)),
         PathSeg::Cubic(c) => PathSeg::Cubic(CubicBez::new(c.p3, c.p2, c.p1, c.p0)),
+    }
+}
+
+/// `piece` of the band's outline, oriented with the band on its right, or
+/// `None` where the band paints both sides of it.
+///
+/// A band wider than the shape it lines folds over itself: past the radius
+/// of curvature, its offset edge turns back across the band. The part of
+/// that edge inside the fill has band on both sides, with winding 1 on one
+/// and 2 on the other, so it bounds nothing. If kept, it closes into a
+/// sliver of opposite winding that leaves an unpainted line across a loop
+/// the band should fill.
+fn band_boundary(band: &[PathEl], piece: PathSeg, probe: f64) -> Option<PathSeg> {
+    const H: f64 = 0.05;
+    let tan = piece.eval(0.5 + H) - piece.eval(0.5 - H);
+    let len = tan.hypot();
+    if len <= 0.0 || probe <= 0.0 {
+        return Some(piece);
+    }
+    // Winding steps up by one from the left of an edge to its right, so the
+    // winding on the left tells both sides.
+    let right = tan.turn_90() * (probe / len);
+    match crate::orient::winding(band, piece.eval(0.5) - right) {
+        0 => Some(piece),
+        -1 => Some(reverse(piece)),
+        _ => None,
     }
 }
 
@@ -332,8 +385,10 @@ fn stitch(pieces: &[PathSeg], eps: f64, out: &mut BezPath) {
             cur = next;
         }
         loop_path.close_path();
-        // Sub-resolution slivers paint nothing but cost segments.
-        if loop_path.elements().len() >= 4 && loop_path.elements().area().abs() > eps * eps {
+        // Sub-resolution slivers paint nothing but cost segments. Judge them
+        // by area alone. A loop of a single curve can be real: a lobe cut
+        // off at a crossing is often one cubic.
+        if loop_path.elements().area().abs() > eps * eps {
             out.extend(loop_path.iter());
         }
     }

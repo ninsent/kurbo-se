@@ -88,15 +88,6 @@ pub(crate) struct Band<'a> {
     /// nothing, leaving the boundary accumulators intact. The region
     /// construction uses this to read a raw offset boundary directly.
     pub(crate) suppress_finish: bool,
-    /// Segment-index ranges of outer-side join geometry emitted in
-    /// `raw_offset` mode, each with the fraction of `w` it may legitimately
-    /// come within of its corner: `1` for round joins and miters, which
-    /// stay at or beyond `w`, and `cos(φ/2)` for a bevel chord, which cuts
-    /// the corner. The region pruner relaxes the distance test by that
-    /// factor. It is bounded, so inner-side overshoot at extreme widths
-    /// stays prunable.
-    pub(crate) left_join_segs: alloc::vec::Vec<(u32, u32, f64)>,
-    pub(crate) right_join_segs: alloc::vec::Vec<(u32, u32, f64)>,
 }
 
 impl<'a> Band<'a> {
@@ -121,8 +112,6 @@ impl<'a> Band<'a> {
             last_pt: Point::ORIGIN,
             last_tan: Vec2::ZERO,
             suppress_finish: false,
-            left_join_segs: alloc::vec::Vec::new(),
-            right_join_segs: alloc::vec::Vec::new(),
         }
     }
 
@@ -359,29 +348,7 @@ impl<'a> Band<'a> {
             }
             return;
         }
-        // Raw-offset mode: remember which segments the outer-side join is
-        // about to emit, so the region pruner can relax the distance test
-        // over them. See the field docs on `left_join_segs`.
-        let tag_left = self.p.raw_offset && cross > 0.0 && self.p.d_left > 0.0;
-        let tag_right = self.p.raw_offset && cross < 0.0 && self.p.d_right > 0.0;
-        let (l0, r0) = (self.left.elements().len(), self.right.elements().len());
-        // How close to its corner this join's geometry may legitimately come,
-        // as a fraction of the band width. A bevel chord between two points
-        // at distance `w` passes at `w·cos(φ/2)`; round fans and miter legs
-        // never come inside `w`.
         let miter_ok = 2.0 * hypot < (hypot + dot) * self.p.miter_limit * self.p.miter_limit;
-        let join_relax = match self.p.join {
-            Join::Round => 1.0,
-            Join::Miter if miter_ok => 1.0,
-            _ => {
-                let c = if hypot > 0.0 {
-                    ((1.0 + dot / hypot) * 0.5).clamp(0.0, 1.0)
-                } else {
-                    1.0
-                };
-                math::sqrt(c)
-            }
-        };
         if self.p.raw_offset {
             // Fall through to the plain join emission below, which bevels
             // the inner side and leaves the overshoot loop the pruner needs.
@@ -450,21 +417,6 @@ impl<'a> Band<'a> {
                     }
                 }
             }
-        }
-        // Segment index = element index − 1 (the leading MoveTo).
-        if tag_left && self.left.elements().len() > l0 {
-            self.left_join_segs.push((
-                l0 as u32 - 1,
-                self.left.elements().len() as u32 - 1,
-                join_relax,
-            ));
-        }
-        if tag_right && self.right.elements().len() > r0 {
-            self.right_join_segs.push((
-                r0 as u32 - 1,
-                self.right.elements().len() as u32 - 1,
-                join_relax,
-            ));
         }
     }
 

@@ -2,6 +2,133 @@
 
 This changelog follows <https://keepachangelog.com/en/>.
 
+## Unreleased
+
+### Fixed
+
+- Strokes with bevel or miter joins no longer tear apart when the width
+  gets close to the spacing of the corners. The stroker drops the parts of
+  an offset outline that fall inside the stroke, and it measured that as
+  if every corner were round. A bevel's straight edge sits closer to the
+  corner than the width, so it got dropped, while parts inside a miter's
+  tip were kept. A star stroked centered at width 32 came out with holes
+  in its arms, and a 24-tooth gear with bevels filled solid when stroked
+  inside from width 7.5 on. The check now uses the real shape of each
+  join: a triangle for a bevel, a kite for a miter, a disc for a round
+  join.
+- Dashed strokes on one side of a path that crosses itself now put their
+  dashes where kurbo does. Such a stroke cuts the path at its crossings
+  and dashes each piece on its own, so every piece has to pick up the
+  pattern where the whole path has it. That offset went the wrong way, it
+  was guessed rather than measured inside curves, and on closed paths it
+  carried on past the start point, where kurbo starts the pattern again.
+  On a bowtie, a figure-eight or a looping curve, the dashes after the
+  first crossing ended up in the wrong place. Centered strokes, and paths
+  that don't cross themselves, were not affected.
+- Dashed strokes no longer draw stray dots. A zero-length dash that
+  landed exactly on a crossing was drawn by both pieces that meet there.
+  Rounding added more where pattern boundaries fall on corners or on the
+  start point, which is common on shapes with whole-number edge lengths:
+  a dash about `1e-14` long still got round caps and drew a disc. The
+  stroker now allows for rounding at those points and drops dashes too
+  short to matter.
+- Dashed strokes no longer produce `NaN` coordinates. kurbo's `dash`
+  returns `NaN` when a zero-length entry of the pattern lands exactly on
+  the end of a segment, and the corrected dash positions made that
+  common enough to hit 31 of 48,000 random dashed strokes. Those elements
+  are now dropped.
+- A dash that runs to the end of an open path keeps the path's end cap
+  again. kurbo can end such a dash a hair short, at `x = 7.299999999999999`
+  on a line ending at 7.3, and the stroker then gave it the dash cap
+  instead. Endpoints now match within the distance the stroker resolves.
+- One-sided strokes now go on the right side of the loop in a curve that
+  crosses itself. The stroker decides which side is filled by testing a
+  point just inside the loop, and kurbo's winding count missed both
+  crossings there. On the sandbox's looping cubic the loop was taken for
+  empty, so outside strokes went into it. The stroker now counts the
+  crossings itself, along a line that cuts across the curve, and makes
+  sure the point it tests is not sitting on the curve.
+- Dashed inside strokes now line the loop of a self-crossing curve instead
+  of filling it. After a dash is trimmed to the fill, outlines made of a
+  single curve were thrown away as slivers, but a loop cut off at a
+  crossing is often just one curve. Outlines are now judged by their area.
+- Dashed inside and outside strokes no longer leave unpainted gaps where
+  they are wider than the shape. There the inner edge of a dash folds back
+  across the dash, and the part inside the fill was kept although it
+  bounds nothing. That left an unpainted line across the sandbox's loop at
+  width 10. A dash is now also cut where it crosses itself, and an edge is
+  kept only where the dash covers just one side of it.
+- Inside and outside strokes no longer switch sides when the fill test
+  lands on a curve. The stroker tests a point just below the highest
+  points of a contour, and it counted the points where a curve reaches
+  furthest left or right among them. Below such a point the test lands on
+  the curve itself. A 12-point star with inward-curved edges was stroked
+  on the wrong side at every width. Only a curve's highest and lowest
+  points count now.
+- Paths are now cut where they actually cross. The crossing search ends
+  by crossing straight approximations, which can land well off the real
+  crossing when a curve has a control point bunched at one end: 11 units
+  off on a notch of Impact's `w`. Cut there, a shape could be stroked on
+  the wrong side, or dashed from the wrong place. A few Newton steps now
+  move each crossing onto both curves. On 1,344 curved stars the strokes
+  with wrong points went from 89 to 5, and on spiky polygons from 8 to 2.
+- Inside and centered strokes on very spiky shapes no longer fill solid or
+  paint the middle at large widths. Near the width where the inside of
+  such a shape disappears, what's left is a small ring of short arcs. The
+  stroker closed a loop as soon as it came back near its start, so each
+  arc became its own loop and was dropped as a sliver. Each arc also ran a
+  little past its neighbours, by less than the trimming margin, and those
+  overshoots made extra loops in the middle. A loop now closes only if it
+  bounds more than a sliver, and at a crossing the piece that heads into
+  the other stroke is dropped, with a few exceptions glyphs needed.
+
+Gears show the last fix well. A 24-tooth gear stroked inside at widths 60
+to 80 used to fill solid, and so did a 750-tooth gear at widths 8 to 30.
+Both now keep their middle. On text the changes are neutral: letters,
+digits and `&@$%#?` from Inter and 15 macOS fonts, stroked at widths 2 and
+12 with every alignment and compared point by point against what the
+stroke should cover, went from 7,117 wrong points to 7,064 over 15,504
+cases.
+
+### Changed
+
+- Inside strokes with bevel joins now fill a shape solid at a larger width
+  than round joins. A bevel cuts across a concave corner, so it reaches
+  less far. The test star now fills solid from about width 48.7 with
+  bevels, against 40 with round joins. Before, it filled solid from
+  about 25.
+- Shapes with many corners got slower because of the new join check and
+  the refined crossings. The 10-point star's inside stroke went from 7.4
+  to 9.3 µs, and a 240-tooth gear is 10–12% slower. Curved shapes and
+  dashed strokes are within noise of 0.1.2. The 0.1.1 figure for a
+  1500-segment gear, 254 ms down to 28 ms, may have been measured on a
+  wrong result: that gear's inside stroke used to fill solid.
+- `tests/golden.txt` is regenerated. 21 of its 82 cases change: the dashed
+  one-sided cases on the bowtie, figure-eight and loop curve, the solid
+  one-sided cases on the loop curve, and eleven where the refined
+  crossings move the outline a little.
+
+### Added
+
+- Tests for each fix: bevel and miter joins on stars and a gear, dash
+  positions and dots on self-crossing paths checked against
+  `kurbo::dash`, the end cap, the loop's fill side, the spiky gears,
+  Inter's `4`, a thin `#` and the curved stars. The `check_at` helper
+  gained `check_side_at`, which checks one alignment.
+- Benchmarks for a 750-tooth gear stroked inside at width 8: 16.0 ms with
+  round joins, 9.5 ms with the default miter.
+
+### Sandbox
+
+- The native SVG reference now draws its dashes where the crate does. It
+  passed the dash offset negated, so the red reference dashes sat away
+  from the crate's. kurbo reads the offset exactly like SVG's
+  `stroke-dashoffset`, so it now goes through unchanged.
+- A new gallery entry, "Text (type your own)", strokes up to 32 characters
+  of your own text in the bundled Inter Regular. Overlapping parts are
+  merged first, so touching letters stroke as one outline. The text, its
+  size and the merge switch go in the URL like the other settings.
+
 ## 0.1.2 (2026-10-11)
 
 ### Fixed
