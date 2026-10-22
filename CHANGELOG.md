@@ -2,7 +2,7 @@
 
 This changelog follows <https://keepachangelog.com/en/>.
 
-## Unreleased
+## 0.2.0 (2026-10-22)
 
 ### Fixed
 
@@ -97,12 +97,31 @@ cases.
   less far. The test star now fills solid from about width 48.7 with
   bevels, against 40 with round joins. Before, it filled solid from
   about 25.
+- Large and detailed paths stroke much faster. Finding crossings no
+  longer tests every pair of segments, distance checks read only nearby
+  edges, and stitching, fill tests and the dash mask skip work whose
+  answer is already known. Against the fixed code before these speedups,
+  a circle drawn as 4,000 tiny lines strokes in 0.7–0.9 ms instead of
+  12–16 ms, a braid that crosses itself 161 times in 11 ms instead of 87,
+  a plate with 64 holes 20–26% faster, and the 750-tooth gear in 5.9 ms
+  instead of 9.4. A rounded rectangle stroked centered as wide as its
+  corners, where the inner offset collapses, takes 9.5 ms instead of 16.
+  Most small shapes got faster too, but a few are still slower: a rounded
+  rectangle takes 5.9 µs instead of 5.5, a 25-tooth gear 278 µs instead
+  of 254, a five-point star stroked inside at width 500 10.1 µs instead
+  of 9.3, and a five-point polyline 0.59 µs instead of 0.49. The output is
+  the same, bit for bit, on about 5,200 test cases.
+- A reused `AlignedStrokeCtx` now also keeps the working storage of the
+  region construction and the dash mask, so animated and batched strokes
+  allocate far less. 200 small shapes stroke 19% faster through one
+  context than before, and an animated dashed star 14% faster.
 - Shapes with many corners got slower because of the new join check and
-  the refined crossings. The 10-point star's inside stroke went from 7.4
-  to 9.3 µs, and a 240-tooth gear is 10–12% slower. Curved shapes and
-  dashed strokes are within noise of 0.1.2. The 0.1.1 figure for a
-  1500-segment gear, 254 ms down to 28 ms, may have been measured on a
-  wrong result: that gear's inside stroke used to fill solid.
+  the refined crossings: the 10-point star's inside stroke went from 7.4
+  to 9.3 µs, and with the speedups above it is at 8.8 µs. Curved shapes
+  and dashed strokes are within noise of 0.1.2 or faster. The 0.1.1
+  figure for a 1500-segment gear, 254 ms down to 28 ms, may have been
+  measured on a wrong result: that gear's inside stroke used to fill
+  solid.
 - `tests/golden.txt` is regenerated. 21 of its 82 cases change: the dashed
   one-sided cases on the bowtie, figure-eight and loop curve, the solid
   one-sided cases on the loop curve, and eleven where the refined
@@ -115,8 +134,13 @@ cases.
   `kurbo::dash`, the end cap, the loop's fill side, the spiky gears,
   Inter's `4`, a thin `#` and the curved stars. The `check_at` helper
   gained `check_side_at`, which checks one alignment.
-- Benchmarks for a 750-tooth gear stroked inside at width 8: 16.0 ms with
-  round joins, 9.5 ms with the default miter.
+- Benchmarks for a 750-tooth gear stroked inside at width 8, and
+  `benches/workloads.rs`: 70 more, from UI shapes and long dashed paths to
+  tiny segments and extreme widths.
+- `tools/regress`, which strokes about 5,200 shapes and styles with a
+  reference revision and with the working tree and checks that they paint
+  the same, and `tests/context_reuse.rs`, which checks that a reused
+  context gives the same output as a fresh one.
 
 ### Sandbox
 

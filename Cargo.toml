@@ -1,6 +1,6 @@
 [package]
 name = "kurbo-se"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0 OR MIT"
@@ -12,7 +12,7 @@ readme = "README.md"
 repository = "https://github.com/ninsent/kurbo-se"
 homepage = "https://github.com/ninsent/kurbo-se"
 documentation = "https://docs.rs/kurbo-se"
-exclude = ["sandbox", "examples", "docs", "upstream", ".github", "tests/golden.txt"]
+exclude = ["sandbox", "examples", "docs", "upstream", "tools", ".github", "tests/golden.txt"]
 
 [package.metadata.docs.rs]
 all-features = true
@@ -54,4 +54,8 @@ features = ["cargo_bench_support"]
 
 [[bench]]
 name = "expand"
+harness = false
+
+[[bench]]
+name = "workloads"
 harness = false

@@ -94,20 +94,28 @@ Width profiles are out of scope.
 
 ## Performance
 
-Measured on an Apple-silicon laptop at tolerance 0.25 (criterion, release):
+Measured on an Apple-silicon laptop at tolerance 0.25 (criterion,
+release):
 
 | Case | time |
 |---|---|
-| 10-point star (lines), inside, solid | 9.3 µs |
-| circle (62 segs), center, solid | 50 µs (kurbo's native stroker: 12.9 µs) |
-| circle (62 segs), inside, solid | 32 µs |
-| circle, inside, dashed + round dash caps | 55 µs |
-| donut (124 segs, hole), inside, solid | 99 µs |
-| 40-cubic wavy path, inside, solid | 106 µs |
-| 40-cubic wavy path, inside, dashed | 143 µs |
+| 10-point star (lines), inside, solid | 8.8 µs |
+| circle (62 segs), center, solid | 47 µs (kurbo's native stroker: 12.8 µs) |
+| circle (62 segs), inside, solid | 30 µs |
+| circle, inside, dashed + round dash caps | 48 µs |
+| donut (124 segs, hole), inside, solid | 84 µs |
+| 40-cubic wavy path, inside, solid | 99 µs |
+| 40-cubic wavy path, inside, dashed | 134 µs |
+| 750-tooth gear, inside, width 8 | 5.9 ms (round joins: 10.5 ms) |
+| circle drawn as 4,000 tiny lines, inside, width 4 | 0.68 ms |
+| raw freehand trace (2,000 points), inside, width 3 | 125 µs |
+| organic blob (800 cubics), inside, width 8 | 323 µs |
+| plate with 64 round holes, inside, width 4 | 650 µs |
+| braid crossing itself 161 times (998 lines), outside, width 6 | 10.6 ms |
 
-Run-to-run variation on a laptop is a few percent, so treat these as
-magnitudes rather than exact figures.
+Run-to-run variation on a laptop is about 5%, so treat these as
+magnitudes rather than exact figures. `cargo bench --bench workloads`
+runs these cases and many more.
 
 Solid centered strokes on closed contours use the same set construction as
 one-sided ones; that is what keeps an over-wide circle solid. Centered
@@ -118,17 +126,19 @@ smooth contour at moderate width — a fast path classifies each offset loop
 whole and skips the cut/prune/stitch machinery. Polylines, the common UI
 case, stay in single-digit microseconds. Degenerate widths (an offset
 collapsing to a point at `w = r`, two offsets coinciding at half a ring's
-thickness) are guarded and stay near a millisecond. Dashed one-sided
-strokes also mask each dash against the fill; the mask short-circuits
-wherever the band leaves the fill by less than `tolerance`, so the usual
-cost is a per-dash scan, not a Boolean.
+thickness) are guarded. Most stay near a millisecond; a rounded rectangle
+whose corners collapse takes 10–15 ms. Dashed one-sided strokes also mask
+each dash against the fill; the mask short-circuits wherever the band
+leaves the fill by less than `tolerance`, so the usual cost is a per-dash
+scan, not a Boolean.
 
 Re-expanding per frame (an animated `dash.offset`, for example) is the
 supported model; there is no caching layer to manage. Use
-[`stroke_aligned_with`] with a reused [`AlignedStrokeCtx`] so the large
-expansion buffers keep their capacity across calls, like kurbo's own
-`StrokeCtx`. The region and dash-mask stages still make small per-call
-allocations, which the numbers above include.
+[`stroke_aligned_with`] with a reused [`AlignedStrokeCtx`], like kurbo's
+own `StrokeCtx`. It keeps the expansion buffers and the working storage of
+the region construction and the dash mask, so animated and batched
+strokes allocate little: 200 small shapes stroke 18% faster through one
+context than through a new one each.
 
 ## Renderer integration
 

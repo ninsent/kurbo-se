@@ -5,5 +5,7 @@
 /sandbox/dist
 /sandbox/wasm/pkg
 /sandbox/wasm/target
+/tools/regress/target
 Cargo.lock
 !/examples/vello-demo/Cargo.lock
+!/tools/regress/Cargo.lock

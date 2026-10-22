@@ -7,11 +7,12 @@ pins one kurbo minor per kurbo-se minor and re-exports it
 | kurbo-se | kurbo | vello (via peniko) | notes |
 |---|---|---|---|
 | 0.1.x | 0.13.x (≥ 0.13.1) | 0.10.x | initial release |
+| 0.2.x | 0.13.x (≥ 0.13.1) | 0.10.x | join and dash fixes, faster stroking |
 
 ## Update policy
 
 - When kurbo publishes a new minor (0.14, say), kurbo-se follows with its
-  own minor (0.2) that bumps the dependency, re-verifies the assumptions
+  own minor (0.3) that bumps the dependency, re-verifies the assumptions
   this crate makes about kurbo's internals (join emission structure, the
   `offset_cubic` contract, dash seam semantics), and re-runs the full
   suite: unit tests, the degenerate matrix, the winding properties, the

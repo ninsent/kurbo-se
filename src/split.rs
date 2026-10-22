@@ -46,11 +46,13 @@ pub(crate) struct SplitPiece {
     pub closed: bool,
 }
 
-/// A dash unit: a contiguous run between crossings, carrying its
-/// arc-length start in the original subpath so dashing stays
-/// phase-continuous.
+/// A dash unit: a contiguous run between crossings.
 pub(crate) struct SplitArc {
     pub els: BezPath,
+    /// The arc length at which the run starts in the original subpath, so
+    /// that dashing keeps its phase. Only dashing reads it. It is measured
+    /// only when [`split_self_intersections`] is asked to, and is `0`
+    /// otherwise.
     pub s0: f64,
     pub piece_ix: usize,
     /// Set on the arc of a closed subpath that runs through its start
@@ -73,13 +75,107 @@ pub(crate) struct SplitResult {
     pub crossing_points: Vec<Point>,
 }
 
+/// The crossings of `segs`, each as the two `(segment, t)` cuts it makes,
+/// in the order of a nested loop over segment `i`: its own loops first,
+/// then its crossings with each later segment `j`, by `j`.
+///
+/// This order is part of the result. Crossings are numbered in it, and the
+/// cuts are then sorted along the path by a stable sort, so cuts on the
+/// same point keep it. The broad phase visits pairs in no set order. So
+/// each crossing is stored with its place in the loop, `(i, j, k)` for the
+/// `k`th hit of the pair, and sorted by it at the end. No two crossings
+/// share a place, so the unstable sort has only one result. Only actual
+/// crossings are stored, never the candidate pairs.
+fn collect_crossings(
+    segs: &[PathSeg],
+    bboxes: &[Rect],
+    closed: bool,
+    accuracy: f64,
+) -> impl Iterator<Item = ((usize, f64), (usize, f64))> {
+    let n = segs.len();
+    let mut found: Vec<((usize, usize, usize), f64, f64)> = Vec::new();
+    for (i, seg) in segs.iter().enumerate() {
+        // Single-segment self-intersection (cubic loops).
+        for (k, (t1, t2)) in seg_self_intersections(seg, accuracy)
+            .into_iter()
+            .enumerate()
+        {
+            found.push(((i, i, k), t1, t2));
+        }
+    }
+    crate::broad::for_each_overlapping_pair(
+        n,
+        |i| bboxes[i],
+        accuracy,
+        |i, j| {
+            let adjacent_next = j == i + 1;
+            let adjacent_wrap = closed && i == 0 && j == n - 1;
+            let hits = segment_pair_params_boxed(
+                (&segs[i], bboxes[i]),
+                (&segs[j], bboxes[j]),
+                adjacent_next,
+                adjacent_wrap,
+                accuracy,
+            );
+            for (k, (ta, tb)) in hits.into_iter().enumerate() {
+                // A touch at an end of both segments is left to the revisit
+                // pass, `collect_revisits`. It finds each touch once, not
+                // once for every pair of segments that meet there.
+                let a_end = !(T_EPS..=1.0 - T_EPS).contains(&ta);
+                let b_end = !(T_EPS..=1.0 - T_EPS).contains(&tb);
+                if a_end && b_end {
+                    continue;
+                }
+                found.push(((i, j, k), ta, tb));
+            }
+        },
+    );
+    found.sort_unstable_by_key(|&(at, _, _)| at);
+    found
+        .into_iter()
+        .map(|((i, j, _), ta, tb)| ((i, ta), (j, tb)))
+}
+
+/// The pairs of segments `(i, j)`, `i < j`, whose end points lie within
+/// `sqrt(vtx_eps2)` of each other: the places where the path revisits an
+/// anchor. They come in the order of a nested loop, like
+/// [`collect_crossings`]. The end of an open path touching an interior
+/// vertex is a T-touch, not a crossing, and is left out.
+///
+/// The broad phase finds the candidates, on boxes that are single points.
+/// Its slack is twice the radius, so every pair within the radius is a
+/// candidate despite rounding in `sqrt`. The exact distance test decides.
+fn collect_revisits(segs: &[PathSeg], closed: bool, vtx_eps2: f64) -> Vec<(usize, usize)> {
+    let n = segs.len();
+    let mut revisits: Vec<(usize, usize)> = Vec::new();
+    crate::broad::for_each_overlapping_pair(
+        n,
+        |i| Rect::from_points(segs[i].end(), segs[i].end()),
+        2.0 * crate::math::sqrt(vtx_eps2),
+        |i, j| {
+            let t_touch = j == n - 1 && !closed;
+            if !t_touch && (segs[i].end() - segs[j].end()).hypot2() <= vtx_eps2 {
+                revisits.push((i, j));
+            }
+        },
+    );
+    revisits.sort_unstable();
+    revisits
+}
+
 /// Split `subpath` at its self-intersections. Returns `None` when the
 /// subpath is simple (the caller keeps the untouched fast path) or when
 /// decomposition fails structurally.
+///
+/// `measure` asks for the arc length at which each arc starts,
+/// [`SplitArc::s0`]. Only dashing reads it. Measuring every segment to
+/// dash accuracy costs more than the rest of the split, so solid strokes
+/// pass `false` and get `0` there.
 pub(crate) fn split_self_intersections(
     subpath: &[PathEl],
     closed: bool,
     accuracy: f64,
+    measure: bool,
 ) -> Option<SplitResult> {
     // Degenerate segments carry no geometry, but their endpoints coincide
     // with their neighbours'. The duplicate-vertex pass below would read a
@@ -120,30 +216,8 @@ pub(crate) fn split_self_intersections(
         n_crossings += 1;
     };
 
-    for i in 0..n {
-        // Single-segment self-intersection (cubic loops).
-        for (t1, t2) in seg_self_intersections(&segs[i], accuracy) {
-            push_crossing(&mut cuts, (i, t1), (i, t2));
-        }
-        for j in (i + 1)..n {
-            let adjacent_next = j == i + 1;
-            let adjacent_wrap = closed && i == 0 && j == n - 1;
-            if !overlaps(bboxes[i], bboxes[j], accuracy) {
-                continue;
-            }
-            let hits =
-                segment_pair_params(&segs[i], &segs[j], adjacent_next, adjacent_wrap, accuracy);
-            for (ta, tb) in hits {
-                // Mutual endpoint touches are handled by the duplicate-vertex
-                // pass below (once, instead of once per incident pair).
-                let a_end = !(T_EPS..=1.0 - T_EPS).contains(&ta);
-                let b_end = !(T_EPS..=1.0 - T_EPS).contains(&tb);
-                if a_end && b_end {
-                    continue;
-                }
-                push_crossing(&mut cuts, (i, ta), (j, tb));
-            }
-        }
+    for (a, b) in collect_crossings(&segs, &bboxes, closed, accuracy) {
+        push_crossing(&mut cuts, a, b);
     }
 
     // Crossings at vertices, where the path revisits an anchor point. A
@@ -165,18 +239,8 @@ pub(crate) fn split_self_intersections(
         let e = crate::normalize::RESOLUTION * crate::normalize::extent(subpath);
         (e * e).max(f64::MIN_POSITIVE)
     };
-    let vertex_after: Vec<Point> = segs.iter().map(|s| s.end()).collect();
-    for i in 0..n.saturating_sub(1) {
-        for j in (i + 1)..n {
-            if j == n - 1 && !closed {
-                // The end of an open path touching an interior vertex is a
-                // T-touch, not a crossing.
-                continue;
-            }
-            if (vertex_after[i] - vertex_after[j]).hypot2() <= vtx_eps2 {
-                push_crossing(&mut cuts, (i, 1.0), (j, 1.0));
-            }
-        }
+    for (i, j) in collect_revisits(&segs, closed, vtx_eps2) {
+        push_crossing(&mut cuts, (i, 1.0), (j, 1.0));
     }
 
     if n_crossings == 0 {
@@ -203,7 +267,11 @@ pub(crate) fn split_self_intersections(
     let mut s = 0.0;
     let mut cut_ix = 0;
     for (i, seg) in segs.iter().enumerate() {
-        let seg_len = crate::math::arclen(seg, ARCLEN_ACC);
+        let seg_len = if measure {
+            crate::math::arclen(seg, ARCLEN_ACC)
+        } else {
+            0.0
+        };
         let mut t0 = 0.0;
         while cut_ix < cuts.len() && cuts[cut_ix].seg == i {
             let c = &cuts[cut_ix];
@@ -221,7 +289,11 @@ pub(crate) fn split_self_intersections(
             // Measured, not `seg_len * t`: arc length is proportional to
             // the parameter only on a line. On a looping cubic the
             // difference can shift the dash pattern by several units.
-            cur_s0 = s + crate::math::arclen(&seg.subsegment(0.0..t), ARCLEN_ACC);
+            cur_s0 = if measure {
+                s + crate::math::arclen(&seg.subsegment(0.0..t), ARCLEN_ACC)
+            } else {
+                0.0
+            };
             cur = BezPath::new();
             cur.move_to(seg.eval(t));
             t0 = t;
@@ -380,6 +452,43 @@ pub(crate) fn segment_pair_params(
     wrap: bool,
     accuracy: f64,
 ) -> Vec<(f64, f64)> {
+    pair_params(a, b, None, next, wrap, accuracy)
+}
+
+/// [`segment_pair_params`] for a caller that already has the exact boxes of
+/// both segments, from `ParamCurveExtrema::bounding_box`, as the broad
+/// phase does.
+///
+/// The search starts from those boxes instead of solving for them again.
+/// They are the boxes it would solve for, so the result is the same. Most
+/// pairs the broad phase passes are settled by the first step, so those
+/// two solves were most of the search's cost. An adjacent pair, `next` or
+/// `wrap`, is searched over a trimmed domain that the boxes of the whole
+/// segments do not describe, so it solves for its own.
+pub(crate) fn segment_pair_params_boxed(
+    (a, a_box): (&PathSeg, Rect),
+    (b, b_box): (&PathSeg, Rect),
+    next: bool,
+    wrap: bool,
+    accuracy: f64,
+) -> Vec<(f64, f64)> {
+    // Any other box would change where the search goes, and so its result.
+    // The check compares bits, so a `NaN` box matches itself.
+    let same = |r: Rect, s: Rect| {
+        [r.x0, r.y0, r.x1, r.y1].map(f64::to_bits) == [s.x0, s.y0, s.x1, s.y1].map(f64::to_bits)
+    };
+    debug_assert!(same(a_box, a.bounding_box()) && same(b_box, b.bounding_box()));
+    pair_params(a, b, Some((a_box, b_box)), next, wrap, accuracy)
+}
+
+fn pair_params(
+    a: &PathSeg,
+    b: &PathSeg,
+    boxes: Option<(Rect, Rect)>,
+    next: bool,
+    wrap: bool,
+    accuracy: f64,
+) -> Vec<(f64, f64)> {
     let ar = (
         if wrap { ADJ_TRIM } else { 0.0 },
         if next { 1.0 - ADJ_TRIM } else { 1.0 },
@@ -390,21 +499,33 @@ pub(crate) fn segment_pair_params(
     );
     let mut hits: Vec<Hit> = Vec::new();
     let mut budget = SEARCH_BUDGET;
+    let accuracy = accuracy.max(1e-9);
     if next || wrap {
+        // The pieces are trimmed, so the boxes of the whole segments do not
+        // apply.
         let a_sub = a.subsegment(ar.0..ar.1);
         let b_sub = b.subsegment(br.0..br.1);
         recurse(
-            &a_sub,
-            ar,
-            &b_sub,
-            br,
-            accuracy.max(1e-9),
+            &Piece::new(&a_sub, ar),
+            &Piece::new(&b_sub, br),
+            accuracy,
             0,
             &mut hits,
             &mut budget,
         );
     } else {
-        recurse(a, ar, b, br, accuracy.max(1e-9), 0, &mut hits, &mut budget);
+        let (a_box, b_box) = boxes.unwrap_or_else(|| (a.bounding_box(), b.bounding_box()));
+        let a = Piece {
+            seg: a,
+            range: ar,
+            bbox: a_box,
+        };
+        let b = Piece {
+            seg: b,
+            range: br,
+            bbox: b_box,
+        };
+        recurse(&a, &b, accuracy, 0, &mut hits, &mut budget);
     }
     if hits.is_empty() {
         return Vec::new();
@@ -417,17 +538,29 @@ pub(crate) fn segment_pair_params(
 /// Subdivide a segment at the given parameters, which are sorted and
 /// deduplicated in place. Interior cuts only.
 pub(crate) fn subdivide_at(seg: &PathSeg, ts: &mut Vec<f64>) -> Vec<PathSeg> {
+    clean_cuts(ts);
+    let mut out = Vec::with_capacity(ts.len() + 1);
+    subdivide_into(seg, ts, &mut out);
+    out
+}
+
+/// Keep the interior cuts of `ts`, sorted. A cut closer than [`DEDUP_EPS`]
+/// to the last one kept is dropped.
+pub(crate) fn clean_cuts(ts: &mut Vec<f64>) {
     ts.retain(|t| *t > T_EPS && *t < 1.0 - T_EPS);
     ts.sort_by(f64::total_cmp);
     ts.dedup_by(|a, b| (*a - *b).abs() < DEDUP_EPS);
-    let mut out = Vec::with_capacity(ts.len() + 1);
+}
+
+/// Append to `out` the pieces of `seg` between consecutive cuts of `ts`.
+/// The cuts must already be cleaned by [`clean_cuts`].
+pub(crate) fn subdivide_into(seg: &PathSeg, ts: &[f64], out: &mut Vec<PathSeg>) {
     let mut t0 = 0.0;
-    for &t in ts.iter() {
+    for &t in ts {
         out.push(seg.subsegment(t0..t));
         t0 = t;
     }
     out.push(seg.subsegment(t0..1.0));
-    out
 }
 
 /// Append `seg` to `path`, starting the path at the segment's start point if
@@ -441,12 +574,6 @@ pub(crate) fn append_seg(path: &mut BezPath, seg: PathSeg) {
         PathSeg::Quad(q) => path.quad_to(q.p1, q.p2),
         PathSeg::Cubic(c) => path.curve_to(c.p1, c.p2, c.p3),
     }
-}
-
-/// Whether two boxes come within `slack` of touching.
-#[inline]
-pub(crate) fn overlaps(a: Rect, b: Rect, slack: f64) -> bool {
-    !(a.x0 > b.x1 + slack || b.x0 > a.x1 + slack || a.y0 > b.y1 + slack || b.y0 > a.y1 + slack)
 }
 
 /// Distance from a segment's control points to its chord (flatness).
@@ -501,10 +628,8 @@ fn seg_self_intersections(seg: &PathSeg, accuracy: f64) -> Vec<(f64, f64)> {
             let pa = seg.subsegment(a0..a1);
             let pb = seg.subsegment(b0..b1);
             recurse(
-                &pa,
-                (a0, a1),
-                &pb,
-                (b0, b1),
+                &Piece::new(&pa, (a0, a1)),
+                &Piece::new(&pb, (b0, b1)),
                 accuracy.max(1e-9),
                 0,
                 &mut hits,
@@ -658,12 +783,34 @@ const MAX_DEPTH: u32 = 28;
 /// comes close to the limit.
 const SEARCH_BUDGET: u32 = 10_000;
 
-#[allow(clippy::too_many_arguments)]
+/// One operand of the intersection search: a piece of a segment, the
+/// parameter range it covers on that segment, and its exact box.
+///
+/// Each step splits one operand and passes the other down unchanged. So a
+/// box is solved for once, when its piece is made, and not again at each
+/// later step that gets the piece. It is the same box those steps solved
+/// for, so the search goes the same way. The piece borrows its segment,
+/// so making one does not copy the curve.
+#[derive(Copy, Clone)]
+struct Piece<'a> {
+    seg: &'a PathSeg,
+    range: (f64, f64),
+    bbox: Rect,
+}
+
+impl<'a> Piece<'a> {
+    fn new(seg: &'a PathSeg, range: (f64, f64)) -> Self {
+        Piece {
+            seg,
+            range,
+            bbox: seg.bounding_box(),
+        }
+    }
+}
+
 fn recurse(
-    a: &PathSeg,
-    ar: (f64, f64),
-    b: &PathSeg,
-    br: (f64, f64),
+    a: &Piece<'_>,
+    b: &Piece<'_>,
     accuracy: f64,
     depth: u32,
     out: &mut Vec<Hit>,
@@ -673,21 +820,15 @@ fn recurse(
         return;
     }
     *budget -= 1;
-    let ba = a.bounding_box();
-    let bb = b.bounding_box();
-    if ba.x0 > bb.x1 + accuracy
-        || bb.x0 > ba.x1 + accuracy
-        || ba.y0 > bb.y1 + accuracy
-        || bb.y0 > ba.y1 + accuracy
-    {
+    if !crate::broad::overlaps(a.bbox, b.bbox, accuracy) {
         return;
     }
-    let fa = flatness(a);
-    let fb = flatness(b);
+    let fa = flatness(a.seg);
+    let fb = flatness(b.seg);
     if (fa <= accuracy && fb <= accuracy) || depth >= MAX_DEPTH {
         // Chord/chord intersection.
-        let (a0, a1) = (a.start(), a.end());
-        let (b0, b1) = (b.start(), b.end());
+        let (a0, a1) = (a.seg.start(), a.seg.end());
+        let (b0, b1) = (b.seg.start(), b.seg.end());
         let da = a1 - a0;
         let db = b1 - b0;
         let denom = da.cross(db);
@@ -699,31 +840,148 @@ fn recurse(
         if !(-1e-9..=1.0 + 1e-9).contains(&s) || !(-1e-9..=1.0 + 1e-9).contains(&t) {
             return;
         }
+        let (ar, br) = (a.range, b.range);
         let ta = ar.0 + s.clamp(0.0, 1.0) * (ar.1 - ar.0);
         let tb = br.0 + t.clamp(0.0, 1.0) * (br.1 - br.0);
         out.push(Hit { ta, tb, ar, br });
         return;
     }
-    // Subdivide the less flat one, or both when they are comparable.
+    // Split one operand: the one that is not flat yet, or the less flat one
+    // when neither is.
     if fa > accuracy && (fa >= fb || fb <= accuracy) {
-        let am = 0.5 * (ar.0 + ar.1);
-        let a_lo = a.subsegment(0.0..0.5);
-        let a_hi = a.subsegment(0.5..1.0);
-        recurse(&a_lo, (ar.0, am), b, br, accuracy, depth + 1, out, budget);
-        recurse(&a_hi, (am, ar.1), b, br, accuracy, depth + 1, out, budget);
+        let (t0, t1) = a.range;
+        let mid = 0.5 * (t0 + t1);
+        let lo = a.seg.subsegment(0.0..0.5);
+        let hi = a.seg.subsegment(0.5..1.0);
+        let a_lo = Piece::new(&lo, (t0, mid));
+        let a_hi = Piece::new(&hi, (mid, t1));
+        recurse(&a_lo, b, accuracy, depth + 1, out, budget);
+        recurse(&a_hi, b, accuracy, depth + 1, out, budget);
     } else {
-        let bm = 0.5 * (br.0 + br.1);
-        let b_lo = b.subsegment(0.0..0.5);
-        let b_hi = b.subsegment(0.5..1.0);
-        recurse(a, ar, &b_lo, (br.0, bm), accuracy, depth + 1, out, budget);
-        recurse(a, ar, &b_hi, (bm, br.1), accuracy, depth + 1, out, budget);
+        let (t0, t1) = b.range;
+        let mid = 0.5 * (t0 + t1);
+        let lo = b.seg.subsegment(0.0..0.5);
+        let hi = b.seg.subsegment(0.5..1.0);
+        let b_lo = Piece::new(&lo, (t0, mid));
+        let b_hi = Piece::new(&hi, (mid, t1));
+        recurse(a, &b_lo, accuracy, depth + 1, out, budget);
+        recurse(a, &b_hi, accuracy, depth + 1, out, budget);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kurbo::{CubicBez, Shape};
+    use kurbo::{CubicBez, ParamCurveArclen, Shape};
+
+    /// The crossings and revisits that the nested loops found before the
+    /// broad phase replaced them, in the loops' order.
+    fn nested_loop_crossings(
+        segs: &[PathSeg],
+        closed: bool,
+        accuracy: f64,
+        vtx_eps2: f64,
+    ) -> Vec<((usize, f64), (usize, f64))> {
+        let n = segs.len();
+        let bboxes: Vec<Rect> = segs.iter().map(ParamCurveExtrema::bounding_box).collect();
+        let mut out = Vec::new();
+        for i in 0..n {
+            for (t1, t2) in seg_self_intersections(&segs[i], accuracy) {
+                out.push(((i, t1), (i, t2)));
+            }
+            for j in (i + 1)..n {
+                if !crate::broad::overlaps(bboxes[i], bboxes[j], accuracy) {
+                    continue;
+                }
+                let next = j == i + 1;
+                let wrap = closed && i == 0 && j == n - 1;
+                for (ta, tb) in segment_pair_params(&segs[i], &segs[j], next, wrap, accuracy) {
+                    let a_end = !(T_EPS..=1.0 - T_EPS).contains(&ta);
+                    let b_end = !(T_EPS..=1.0 - T_EPS).contains(&tb);
+                    if !(a_end && b_end) {
+                        out.push(((i, ta), (j, tb)));
+                    }
+                }
+            }
+        }
+        for i in 0..n.saturating_sub(1) {
+            for j in (i + 1)..n {
+                let t_touch = j == n - 1 && !closed;
+                if !t_touch && (segs[i].end() - segs[j].end()).hypot2() <= vtx_eps2 {
+                    out.push(((i, 1.0), (j, 1.0)));
+                }
+            }
+        }
+        out
+    }
+
+    /// The broad phase gives the crossings and revisits in the order of the
+    /// nested loops. That order numbers the crossings and orders the cuts
+    /// on one point. Each path has enough segments that the broad phase
+    /// sorts and sweeps instead of scanning all pairs: a self-crossing star
+    /// polygon, a self-crossing curve, a rosette that revisits its centre
+    /// six times, and a path that revisits nine anchors, each a little off.
+    #[test]
+    fn crossings_come_out_in_nested_loop_order() {
+        let mut star = BezPath::new();
+        for k in 0..19 {
+            let a = core::f64::consts::TAU * (7 * k) as f64 / 19.0;
+            let p = (100.0 * a.cos(), 100.0 * a.sin());
+            if k == 0 {
+                star.move_to(p);
+            } else {
+                star.line_to(p);
+            }
+        }
+        star.close_path();
+        let mut curve = BezPath::new();
+        curve.move_to((0.0, 0.0));
+        for k in 0..20 {
+            let x = 12.0 * k as f64;
+            curve.curve_to(
+                (x + 40.0, 60.0),
+                (x - 30.0, 60.0),
+                (x + 12.0, (k % 3) as f64),
+            );
+        }
+        let mut rosette = BezPath::new();
+        rosette.move_to((0.0, 0.0));
+        for k in 0..6 {
+            let a = core::f64::consts::TAU * k as f64 / 6.0;
+            let at = |d: f64, off: f64| (d * (a + off).cos(), d * (a + off).sin());
+            rosette.line_to(at(50.0, -0.2));
+            rosette.line_to(at(60.0, 0.2));
+            rosette.line_to((0.0, 0.0));
+        }
+        rosette.close_path();
+        // Twice round a nonagon, taking every second vertex. Each of the
+        // nine anchors is revisited once. The second visit is a little off
+        // the first: within the revisit radius 1e-6, but not on the point.
+        let mut twice = BezPath::new();
+        for k in 0..18 {
+            let a = core::f64::consts::TAU * ((2 * k) % 9) as f64 / 9.0;
+            let off = if k < 9 { 0.0 } else { 0.7e-6 };
+            let p = (80.0 * a.cos() + off, 80.0 * a.sin() + off);
+            if k == 0 {
+                twice.move_to(p);
+            } else {
+                twice.line_to(p);
+            }
+        }
+        twice.close_path();
+        for (path, closed) in [(star, true), (curve, false), (rosette, true), (twice, true)] {
+            let segs: Vec<PathSeg> = path.segments().collect();
+            assert!(segs.len() > crate::broad::SCAN_MAX);
+            let bboxes: Vec<Rect> = segs.iter().map(ParamCurveExtrema::bounding_box).collect();
+            let vtx_eps2 = 1e-12;
+            let mut swept: Vec<_> = collect_crossings(&segs, &bboxes, closed, 1e-3).collect();
+            let revisits = collect_revisits(&segs, closed, vtx_eps2);
+            swept.extend(revisits.into_iter().map(|(i, j)| ((i, 1.0), (j, 1.0))));
+            let nested = nested_loop_crossings(&segs, closed, 1e-3, vtx_eps2);
+            assert!(nested.len() > 5, "{} crossings", nested.len());
+            assert_eq!(swept, nested);
+        }
+    }
 
     /// Two nearly straight cubics cross at about 20°, each with a control
     /// point bunched at its start. At accuracy 4 they are already flat, so
@@ -747,10 +1005,8 @@ mod tests {
         let mut raw = Vec::new();
         let mut budget = SEARCH_BUDGET;
         recurse(
-            &a,
-            (0.0, 1.0),
-            &b,
-            (0.0, 1.0),
+            &Piece::new(&a, (0.0, 1.0)),
+            &Piece::new(&b, (0.0, 1.0)),
             4.0,
             0,
             &mut raw,
@@ -786,15 +1042,15 @@ mod tests {
     #[test]
     fn simple_shapes_do_not_split() {
         let rect = kurbo::Rect::new(0.0, 0.0, 10.0, 10.0).to_path(1e-9);
-        assert!(split_self_intersections(rect.elements(), true, 1e-3).is_none());
+        assert!(split_self_intersections(rect.elements(), true, 1e-3, false).is_none());
         let circle = kurbo::Circle::new((0.0, 0.0), 10.0).to_path(1e-6);
-        assert!(split_self_intersections(circle.elements(), true, 1e-3).is_none());
+        assert!(split_self_intersections(circle.elements(), true, 1e-3, false).is_none());
     }
 
     #[test]
     fn bowtie_splits_into_two_lobes() {
         let p = bowtie();
-        let res = split_self_intersections(p.elements(), true, 1e-3).expect("must split");
+        let res = split_self_intersections(p.elements(), true, 1e-3, false).expect("must split");
         assert_eq!(res.pieces.len(), 2, "bowtie has two lobes");
         for piece in &res.pieces {
             assert!(piece.closed);
@@ -821,16 +1077,21 @@ mod tests {
         let mut p = BezPath::new();
         p.move_to((20.0, 150.0));
         p.curve_to((200.0, 20.0), (0.0, 20.0), (180.0, 150.0));
-        let res = split_self_intersections(p.elements(), false, 1e-3).expect("must split");
+        let res = split_self_intersections(p.elements(), false, 1e-3, true).expect("must split");
         // One closed loop lobe + one open leftover strand.
         assert_eq!(res.pieces.len(), 2);
         let closed_count = res.pieces.iter().filter(|p| p.closed).count();
         assert_eq!(closed_count, 1, "exactly one closed loop");
-        // Arc phases are ascending and start at 0.
-        assert!(res.arcs[0].s0.abs() < 1e-6);
-        for w in res.arcs.windows(2) {
-            assert!(w[0].s0 <= w[1].s0 + 1e-6);
+        // Each arc starts at the arc length where the arcs before it end.
+        let mut s = 0.0;
+        for arc in &res.arcs {
+            assert!((arc.s0 - s).abs() < 1e-6, "s0 {} against {s}", arc.s0);
+            s += arc.els.segments().map(|seg| seg.arclen(1e-9)).sum::<f64>();
         }
+        assert!(s > 100.0);
+        // Without measuring, every arc reads 0.
+        let res = split_self_intersections(p.elements(), false, 1e-3, false).expect("must split");
+        assert!(res.arcs.iter().all(|arc| arc.s0 == 0.0));
     }
 
     #[test]
@@ -842,7 +1103,7 @@ mod tests {
         p.curve_to((90.0, 55.0), (30.0, 55.0), (0.0, 100.0));
         p.curve_to((30.0, 145.0), (90.0, 145.0), (120.0, 100.0));
         p.close_path();
-        let res = split_self_intersections(p.elements(), true, 1e-3).expect("must split");
+        let res = split_self_intersections(p.elements(), true, 1e-3, false).expect("must split");
         assert_eq!(res.pieces.len(), 2, "figure-eight = two lobes");
         // Lobes have opposite orientations (that's the point: each gets its
         // own side resolution).

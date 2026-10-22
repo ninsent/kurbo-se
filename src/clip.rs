@@ -33,11 +33,18 @@ use kurbo::{
     Shape,
 };
 
+use crate::broad::overlaps;
 use crate::region::SourceIndex;
-use crate::split::{self, append_seg, overlaps};
+use crate::split::{self, append_seg};
 
 /// The filled region a dashed band is masked by.
+///
+/// `AlignedStrokeCtx` keeps one and rebuilds it for each dashed stroke, so
+/// the storage is reused from call to call.
+#[derive(Default, Debug)]
 pub(crate) struct ClipSource {
+    /// All the contours, in one path.
+    fill: BezPath,
     /// Exact source segments, oriented so the fill winds `+1`. Pieces of
     /// them are spliced into clipped loops, which keeps the shared boundary
     /// exactly on the source path.
@@ -49,22 +56,31 @@ pub(crate) struct ClipSource {
 }
 
 impl ClipSource {
-    /// `normalized` must be the closed contours with the fill wound `+1`
-    /// (as produced by `ctx::normalize_orientation`).
-    pub(crate) fn new(normalized: &BezPath, flat_tol: f64) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(contours: &[BezPath], flat_tol: f64) -> Self {
+        let mut source = ClipSource::default();
+        source.rebuild(contours, flat_tol);
+        source
+    }
+
+    /// Mask by the fill of `contours`. They must be closed and wound so the
+    /// fill is `+1`, as `ctx::normalize_orientation` leaves them.
+    pub(crate) fn rebuild(&mut self, contours: &[BezPath], flat_tol: f64) {
         let flat_tol = flat_tol.max(1e-9);
-        let segs: Vec<PathSeg> = normalized.segments().collect();
+        self.fill.truncate(0);
+        for c in contours {
+            self.fill.extend(c.iter());
+        }
+        self.segs.clear();
+        self.segs.extend(self.fill.segments());
         // Control-point boxes are looser than the true extrema box but
         // strictly conservative, and this is only a candidate filter.
-        let bboxes = segs.iter().map(control_box).collect();
-        ClipSource {
-            index: SourceIndex::new(normalized, flat_tol),
-            segs,
-            bboxes,
-            // The index is flattened, so a point exactly on the source curve
-            // can read up to one flattening tolerance away from it.
-            eps: flat_tol * 8.0,
-        }
+        self.bboxes.clear();
+        self.bboxes.extend(self.segs.iter().map(control_box));
+        // The index is flattened, so a point exactly on the source curve can
+        // read up to one flattening tolerance away from it.
+        self.eps = flat_tol * 8.0;
+        self.index.rebuild(&self.fill, flat_tol, self.eps);
     }
 
     fn filled(&self, p: Point) -> bool {
@@ -76,20 +92,39 @@ impl ClipSource {
     }
 }
 
+/// Working storage for the mask. `AlignedStrokeCtx` keeps it, so every
+/// dash of every stroke reuses the same buffers.
+#[derive(Default, Debug)]
+pub(crate) struct ClipWork {
+    /// The boxes of one dash's loops, used to spot nested loops.
+    boxes: Vec<Rect>,
+    /// The loop being masked, closed and wound clockwise, and its segments.
+    /// Then, per segment, whether it lies on the fill boundary, and if so,
+    /// whether the band beside it is on the kept side. A segment off the
+    /// boundary passes that second test.
+    oriented: BezPath,
+    lsegs: Vec<PathSeg>,
+    on_bnd: Vec<bool>,
+    on_bnd_ok: Vec<bool>,
+}
+
 /// Mask the expansion of one dash (or dot) by the fill, appending to `out`.
 pub(crate) fn clip_band(
     band: &BezPath,
     src: &ClipSource,
     keep_inside: bool,
     accuracy: f64,
+    work: &mut ClipWork,
     out: &mut BezPath,
 ) {
-    let loops: Vec<&[PathEl]> = crate::normalize::subpaths(band.elements()).collect();
+    let loops = || crate::normalize::subpaths(band.elements());
     // Nested loops are a winding pair that only makes sense together: a
     // gap-free dash expands to a ring. Masking them independently would
     // break the pair, so such output passes through untouched.
-    if loops.len() > 1 {
-        let boxes: Vec<Rect> = loops.iter().map(|l| l.bounding_box()).collect();
+    if loops().nth(1).is_some() {
+        let boxes = &mut work.boxes;
+        boxes.clear();
+        boxes.extend(loops().map(|l| l.bounding_box()));
         let nested = (0..boxes.len())
             .any(|i| (0..boxes.len()).any(|j| i != j && boxes[i].intersect(boxes[j]).area() > 0.0));
         if nested {
@@ -97,8 +132,8 @@ pub(crate) fn clip_band(
             return;
         }
     }
-    for els in loops {
-        clip_loop(els, src, keep_inside, accuracy, out);
+    for els in loops() {
+        clip_loop(els, src, keep_inside, accuracy, work, out);
     }
 }
 
@@ -107,9 +142,18 @@ fn clip_loop(
     src: &ClipSource,
     keep_inside: bool,
     accuracy: f64,
+    work: &mut ClipWork,
     out: &mut BezPath,
 ) {
-    let mut l = BezPath::from_vec(els.to_vec());
+    let ClipWork {
+        oriented: l,
+        lsegs,
+        on_bnd,
+        on_bnd_ok,
+        ..
+    } = work;
+    l.truncate(0);
+    l.extend(els.iter().copied());
     if !matches!(l.elements().last(), Some(PathEl::ClosePath)) {
         l.close_path();
     }
@@ -117,13 +161,14 @@ fn clip_loop(
     // way. The fill is normalised to `+1`, so orient the band clockwise
     // too: positive area in Y-down.
     if l.elements().area() < 0.0 {
-        l = l.reverse_subpaths();
+        *l = l.reverse_subpaths();
     }
-    let lsegs: Vec<PathSeg> = l.segments().collect();
+    lsegs.clear();
+    lsegs.extend(l.segments());
     if lsegs.is_empty() {
         return;
     }
-    let lbb = l.bounding_box();
+    let (l, lsegs): (&BezPath, &[PathSeg]) = (l, lsegs);
 
     // Band pieces lying on the fill boundary: the shared edge of a
     // one-sided band. They are never intersected, since the coincidence
@@ -136,14 +181,13 @@ fn clip_loop(
     // Test the midpoint first: it rejects the offset edge and the caps in
     // one query, so only a genuine boundary run pays for the endpoint
     // tests.
-    let on_bnd: Vec<bool> = lsegs
-        .iter()
-        .map(|s| {
-            src.near_boundary(s.eval(0.5))
-                && src.near_boundary(s.eval(0.0))
-                && src.near_boundary(s.eval(1.0))
-        })
-        .collect();
+    on_bnd.clear();
+    on_bnd.extend(lsegs.iter().map(|s| {
+        src.near_boundary(s.eval(0.5))
+            && src.near_boundary(s.eval(0.0))
+            && src.near_boundary(s.eval(1.0))
+    }));
+    let on_bnd: &[bool] = on_bnd;
     // The band is wound clockwise, so its interior lies to the right of
     // travel (Y-down). Probe just inside it, far enough out to clear the
     // index's flattening error.
@@ -157,11 +201,14 @@ fn clip_loop(
         let probe = s.eval(0.5) + tan.turn_90() * (src.eps / len);
         src.filled(probe) == keep_inside
     };
-    let on_bnd_ok: Vec<bool> = lsegs
-        .iter()
-        .zip(&on_bnd)
-        .map(|(s, b)| !*b || interior_masked(s))
-        .collect();
+    on_bnd_ok.clear();
+    on_bnd_ok.extend(
+        lsegs
+            .iter()
+            .zip(on_bnd)
+            .map(|(s, b)| !*b || interior_masked(s)),
+    );
+    let on_bnd_ok: &[bool] = on_bnd_ok;
 
     // Sub-tolerance excursions are not worth a Boolean. Region membership
     // is already documented as approximate within a tolerance of the
@@ -170,23 +217,19 @@ fn clip_loop(
     // Clip only when the band leaves the mask by more than the accuracy
     // asked for. That keeps the animated-dash path fast at display
     // tolerances and still tightens up as the caller asks for precision.
-    let significant = |s: &PathSeg| {
-        const N: usize = 4;
-        (0..=N).any(|i| {
-            let p = s.eval(i as f64 / N as f64);
-            src.filled(p) != keep_inside && src.index.is_clear_of(p, accuracy * accuracy, None)
-        })
-    };
     let needs_clip = !on_bnd_ok.iter().all(|ok| *ok)
         || lsegs
             .iter()
-            .zip(&on_bnd)
-            .any(|(s, b)| !*b && significant(s));
+            .zip(on_bnd)
+            .any(|(s, b)| !*b && leaves_mask(s, src, keep_inside, accuracy));
     if !needs_clip {
         out.extend(l.iter());
         return;
     }
 
+    // Only a band that gets cut needs its exact box. Computing it solves
+    // for the extrema of every segment, so it waits until here.
+    let lbb = l.bounding_box();
     let cand: Vec<usize> = (0..src.segs.len())
         .filter(|&i| overlaps(src.bboxes[i], lbb, accuracy))
         .collect();
@@ -219,7 +262,7 @@ fn clip_loop(
         // than keeping unconditionally.
         let side_ok = lsegs
             .iter()
-            .zip(&on_bnd)
+            .zip(on_bnd)
             .find(|(_, b)| !**b)
             .is_none_or(|(s, _)| src.filled(s.eval(0.5)) == keep_inside);
         if side_ok {
@@ -233,7 +276,7 @@ fn clip_loop(
     // wholly free of it. A piece straddling the transition would be dropped
     // as coincident and take the free stretch with it, stranding the shared
     // edge as its own loop: a sliver where a clipped dash should be.
-    for (ls, _) in lsegs.iter().zip(&on_bnd).filter(|(_, b)| **b) {
+    for (ls, _) in lsegs.iter().zip(on_bnd).filter(|(_, b)| **b) {
         for t in [0.0, 1.0] {
             let p = ls.eval(t);
             for (ci, &si) in cand.iter().enumerate() {
@@ -298,7 +341,7 @@ fn clip_loop(
             // Skip the stretch the band already carries as its shared edge.
             if lsegs
                 .iter()
-                .zip(&on_bnd)
+                .zip(on_bnd)
                 .any(|(s, b)| *b && s.nearest(m, 1e-9).distance_sq <= src.eps * src.eps)
             {
                 continue;
@@ -308,6 +351,31 @@ fn clip_loop(
     }
 
     stitch(&pieces, (accuracy * 16.0).max(1e-9), out);
+}
+
+/// Whether band segment `s` strays by more than `accuracy` to the side of
+/// the fill that the mask cuts away, judged at five samples along it.
+///
+/// The segment lies inside its control box. If no edge of the fill comes
+/// within `accuracy` of that box, the box has one winding throughout and
+/// lies at least `accuracy` from the fill boundary; see
+/// [`SourceIndex::is_box_clear`]. Every sample then gets the same answer
+/// as the first, so one sample gives the result of all five. Most of a
+/// dash band, its offset edge away from corners, takes this path.
+fn leaves_mask(s: &PathSeg, src: &ClipSource, keep_inside: bool, accuracy: f64) -> bool {
+    if src.index.is_box_clear(control_box(s), accuracy) {
+        return src.filled(s.eval(0.0)) != keep_inside;
+    }
+    leaves_mask_sampled(s, src, keep_inside, accuracy)
+}
+
+/// [`leaves_mask`] without the shortcut: tests all five samples.
+fn leaves_mask_sampled(s: &PathSeg, src: &ClipSource, keep_inside: bool, accuracy: f64) -> bool {
+    const N: usize = 4;
+    (0..=N).any(|i| {
+        let p = s.eval(i as f64 / N as f64);
+        src.filled(p) != keep_inside && src.index.is_clear_of(p, accuracy * accuracy, None)
+    })
 }
 
 /// Conservative box of a segment's control points.
@@ -391,5 +459,67 @@ fn stitch(pieces: &[PathSeg], eps: f64, out: &mut BezPath) {
         if loop_path.elements().area().abs() > eps * eps {
             out.extend(loop_path.iter());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The one-sample shortcut in `leaves_mask` gives the same answer as
+    /// sampling all five points. The segments are random, around a star's
+    /// outline, and many lie within a few `accuracy` of it, where the
+    /// shortcut turns off.
+    #[test]
+    fn one_sample_agrees_with_sampling() {
+        let mut star = BezPath::new();
+        for i in 0..10 {
+            let r = if i % 2 == 0 { 100.0 } else { 40.0 };
+            let a = core::f64::consts::PI * i as f64 / 5.0;
+            let p = (150.0 + r * a.cos(), 150.0 + r * a.sin());
+            if i == 0 {
+                star.move_to(p);
+            } else {
+                star.line_to(p);
+            }
+        }
+        star.close_path();
+        let accuracy = 0.25;
+        let src = ClipSource::new(core::slice::from_ref(&star), accuracy * 0.25);
+        let mut state = 0x853c_49e6_748f_ea9b_u64;
+        let mut rand = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut fast, mut total) = (0, 0);
+        for k in 0..3000 {
+            let p0 = Point::new(30.0 + rand() * 240.0, 30.0 + rand() * 240.0);
+            // Short segments in two sizes, so many of them end near the
+            // outline.
+            let size = if k % 3 == 0 { 0.5 } else { 6.0 };
+            let mut q = || p0 + kurbo::Vec2::new(rand() - 0.5, rand() - 0.5) * size;
+            let seg = if k % 2 == 0 {
+                PathSeg::Line(Line::new(p0, q()))
+            } else {
+                PathSeg::Cubic(CubicBez::new(p0, q(), q(), q()))
+            };
+            for keep_inside in [true, false] {
+                total += 1;
+                fast += usize::from(src.index.is_box_clear(control_box(&seg), accuracy));
+                assert_eq!(
+                    leaves_mask(&seg, &src, keep_inside, accuracy),
+                    leaves_mask_sampled(&seg, &src, keep_inside, accuracy),
+                    "{seg:?}"
+                );
+            }
+        }
+        // Both paths must be tested: the shortcut and the full sampling
+        // each take over a tenth of the cases.
+        assert!(
+            fast > total / 10 && fast < total * 9 / 10,
+            "{fast} of {total}"
+        );
     }
 }

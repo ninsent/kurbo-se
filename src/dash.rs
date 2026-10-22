@@ -19,7 +19,7 @@ use kurbo::{
     BezPath, Cap, ParamCurve, ParamCurveArclen, ParamCurveDeriv, PathEl, Point, Shape as _, Vec2,
 };
 
-use crate::clip::ClipSource;
+use crate::clip::{ClipSource, ClipWork};
 use crate::expand::{Band, BandParams};
 use crate::math;
 use crate::style::DashStyle;
@@ -32,6 +32,16 @@ pub(crate) struct DashClip<'a> {
     /// outside (keep the part outside it).
     pub keep_inside: bool,
     pub accuracy: f64,
+}
+
+/// Working storage for dashing. `AlignedStrokeCtx` keeps it, so every dash
+/// of every stroke reuses the same buffers: the dash being collected, its
+/// band before masking, and the mask's own storage.
+#[derive(Default, Debug)]
+pub(crate) struct DashWork {
+    group: Vec<PathEl>,
+    band: BezPath,
+    clip: ClipWork,
 }
 
 /// Where a piece sits in its subpath's dash pattern.
@@ -124,13 +134,17 @@ pub(crate) fn expand_dashed_subpath(
     true_start: Option<Point>,
     true_end: Option<Point>,
     clip: Option<DashClip<'_>>,
-    group: &mut Vec<PathEl>,
+    work: &mut DashWork,
     left: &mut BezPath,
     right: &mut BezPath,
     scratch: &mut BezPath,
-    band_buf: &mut BezPath,
     out: &mut BezPath,
 ) {
+    let DashWork {
+        group,
+        band: band_buf,
+        clip: clip_work,
+    } = work;
     // kurbo reads the offset like SVG's `stroke-dashoffset`: at arc length
     // `s` the pattern is at `offset + s`. So a piece that starts `s0` into
     // the original subpath starts `offset + s0` into the pattern.
@@ -198,7 +212,14 @@ pub(crate) fn expand_dashed_subpath(
             Some(c) => {
                 band_buf.truncate(0);
                 dots(band_buf);
-                crate::clip::clip_band(band_buf, c.source, c.keep_inside, c.accuracy, out);
+                crate::clip::clip_band(
+                    band_buf,
+                    c.source,
+                    c.keep_inside,
+                    c.accuracy,
+                    clip_work,
+                    out,
+                );
                 band_buf.truncate(0);
             }
             None => dots(out),
@@ -265,7 +286,14 @@ pub(crate) fn expand_dashed_subpath(
                     let mut band = Band::new(p, left, right, scratch, band_buf);
                     band.run(group.iter().copied());
                 }
-                crate::clip::clip_band(band_buf, c.source, c.keep_inside, c.accuracy, out);
+                crate::clip::clip_band(
+                    band_buf,
+                    c.source,
+                    c.keep_inside,
+                    c.accuracy,
+                    clip_work,
+                    out,
+                );
                 band_buf.truncate(0);
             }
             None => {

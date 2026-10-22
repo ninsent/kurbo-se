@@ -103,6 +103,8 @@ extern crate alloc;
 
 pub use kurbo;
 
+mod broad;
+mod buckets;
 mod clip;
 mod ctx;
 mod dash;

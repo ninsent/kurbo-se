@@ -6,7 +6,7 @@
 
 use alloc::vec::Vec;
 
-use kurbo::{BezPath, Cap, PathEl, Shape};
+use kurbo::{BezPath, Cap, Shape};
 
 use crate::dash;
 use crate::expand::{Band, BandParams};
@@ -18,13 +18,20 @@ use crate::style::{StrokeAlignment, StrokeSide, StrokeStyle};
 /// [`StrokeCtx`](kurbo::StrokeCtx) pattern, which was made public for
 /// exactly this purpose.
 ///
-/// Reusing one context across calls lets the large expansion buffers keep
-/// their capacity. That is the intended usage for an animated
-/// `dash_offset`: re-expansion per frame is the supported model, and the
-/// crate docs list measured costs. The direct band path then runs
-/// allocation-free. The region construction and the dash fill mask still
-/// make small per-call allocations (piece lists, flattened indexes), which
-/// the published timings include.
+/// Reusing one context across calls lets its buffers keep their capacity.
+/// That is the intended usage when animating
+/// [`DashStyle::offset`](crate::DashStyle::offset). The supported model is
+/// to expand the stroke again on every frame, and the README lists what
+/// that costs.
+///
+/// The context holds the expansion buffers. It also holds the region
+/// construction's working storage: the flattened source index, and the
+/// offsets and pieces the construction cuts, prunes and stitches. For
+/// dashes, it holds the fill they are masked by and each dash's band. A
+/// call still allocates some buffers of its own, among them per subpath,
+/// in the broad phase of the intersection searches, for the fill probe,
+/// and where a dash is cut against the fill. So reuse saves many
+/// allocations, not all.
 #[derive(Default, Debug)]
 pub struct AlignedStrokeCtx {
     input: BezPath,
@@ -32,9 +39,11 @@ pub struct AlignedStrokeCtx {
     right: BezPath,
     scratch: BezPath,
     sink: BezPath,
-    band_buf: BezPath,
-    dash_group: Vec<PathEl>,
     output: BezPath,
+    source: crate::region::SourceIndex,
+    region: crate::region::RegionWork,
+    mask: crate::clip::ClipSource,
+    dash: dash::DashWork,
 }
 
 impl AlignedStrokeCtx {
@@ -123,9 +132,11 @@ pub fn stroke_aligned_with<'a>(
         right,
         scratch,
         sink,
-        band_buf,
-        dash_group,
         output,
+        source,
+        region,
+        mask,
+        dash: dash_work,
     } = ctx;
 
     // ---- pass 1: decompose into pieces ----------------------------------
@@ -171,7 +182,12 @@ pub fn stroke_aligned_with<'a>(
         let true_start = (!closed).then(|| normalize::start_point(subpath));
         let true_end = (!closed).then(|| normalize::end_point(subpath));
         let split = if needs_split {
-            crate::split::split_self_intersections(subpath, closed, split_accuracy)
+            crate::split::split_self_intersections(
+                subpath,
+                closed,
+                split_accuracy,
+                sanitized_dash.is_some(),
+            )
         } else {
             None
         };
@@ -214,13 +230,14 @@ pub fn stroke_aligned_with<'a>(
     }
 
     // ---- pass 2: resolve sides ------------------------------------------
+    let whole = orient::Fill::new(input);
     for piece in &mut pieces {
         let resolved = orient::resolve(
             style.alignment,
             style.side,
             piece.els.elements(),
             piece.closed,
-            input,
+            &whole,
             probe_scale,
         );
         piece.side = resolved.side;
@@ -267,13 +284,14 @@ pub fn stroke_aligned_with<'a>(
     let mut region_done = alloc::vec![false; pieces.len()];
     if region_mode {
         let into_fill = uniform_fill_side[0];
-        let (specs, index, base) = region_setup(
+        let (specs, base) = region_setup(
             &normalized,
             width,
             2.0 * tolerance / width,
             style,
             miter_limit,
             tolerance,
+            source,
         );
         let kind = if into_fill {
             crate::region::RegionKind::Erosion
@@ -283,7 +301,7 @@ pub fn stroke_aligned_with<'a>(
         let loops = crate::region::region_loops(
             &specs,
             kind,
-            &index,
+            source,
             width,
             &base,
             split_accuracy,
@@ -291,20 +309,21 @@ pub fn stroke_aligned_with<'a>(
             right,
             scratch,
             sink,
+            region,
         );
         if into_fill {
             // F minus the erosion.
             for els in &normalized {
                 output.extend(els.iter());
             }
-            for l in &loops {
+            for l in loops {
                 output.extend(l.reverse_subpaths().iter());
             }
         } else if !loops.is_empty() {
             // The dilation minus F. Without a dilation boundary there is no
             // region at all — emitting bare reversed contours would paint the
             // shape itself.
-            for l in &loops {
+            for l in loops {
                 output.extend(l.iter());
             }
             for els in &normalized {
@@ -334,8 +353,13 @@ pub fn stroke_aligned_with<'a>(
                 && !region_done[*i]
                 && p.closed
                 && p.side == StrokeSide::Center
-                && crate::split::split_self_intersections(p.els.elements(), true, split_accuracy)
-                    .is_none()
+                && crate::split::split_self_intersections(
+                    p.els.elements(),
+                    true,
+                    split_accuracy,
+                    false,
+                )
+                .is_none()
         })
         .map(|(i, _)| i)
         .collect();
@@ -344,22 +368,23 @@ pub fn stroke_aligned_with<'a>(
         let normalized_c: Vec<BezPath> = center_ix
             .iter()
             .map(|&i| {
-                let fill = orient::fill_side(pieces[i].els.elements(), input, probe_scale);
+                let fill = orient::fill_side(pieces[i].els.elements(), &whole, probe_scale);
                 normalize_orientation(&pieces[i].els, fill)
             })
             .collect();
-        let (specs, index, base) = region_setup(
+        let (specs, base) = region_setup(
             &normalized_c,
             half,
             2.0 * tolerance / half.max(1e-12),
             style,
             miter_limit,
             tolerance,
+            source,
         );
         let dilation = crate::region::region_loops(
             &specs,
             crate::region::RegionKind::Dilation,
-            &index,
+            source,
             half,
             &base,
             split_accuracy,
@@ -367,14 +392,19 @@ pub fn stroke_aligned_with<'a>(
             right,
             scratch,
             sink,
+            region,
         );
         // The dilation of nondegenerate geometry always exists; if it comes
         // back empty, fall through to the direct band rather than vanish.
         if !dilation.is_empty() {
+            // Emit the dilation now: the erosion is built in the same storage.
+            for l in dilation {
+                output.extend(l.iter());
+            }
             let erosion = crate::region::region_loops(
                 &specs,
                 crate::region::RegionKind::Erosion,
-                &index,
+                source,
                 half,
                 &base,
                 split_accuracy,
@@ -382,11 +412,9 @@ pub fn stroke_aligned_with<'a>(
                 right,
                 scratch,
                 sink,
+                region,
             );
-            for l in &dilation {
-                output.extend(l.iter());
-            }
-            for l in &erosion {
+            for l in erosion {
                 output.extend(l.reverse_subpaths().iter());
             }
             for &i in &center_ix {
@@ -400,13 +428,10 @@ pub fn stroke_aligned_with<'a>(
     // masked by the fill instead; without the mask, a band that does not
     // fit the local geometry escapes it. See `clip`.
     let clip_source = (sanitized_dash.is_some() && !normalized.is_empty()).then(|| {
-        let mut fill = BezPath::new();
-        for els in &normalized {
-            fill.extend(els.iter());
-        }
         // The mask only has to resolve the fill to within the accuracy the
         // clip itself works at; flattening finer just costs edges.
-        crate::clip::ClipSource::new(&fill, split_accuracy * 0.25)
+        mask.rebuild(&normalized, split_accuracy * 0.25);
+        &*mask
     });
 
     for (ix, piece) in pieces.iter().enumerate() {
@@ -415,7 +440,7 @@ pub fn stroke_aligned_with<'a>(
         }
         // Only closed contours have a fill relationship to mask against;
         // an open subpath's side is a convention, not a region.
-        let clip = match (&clip_source, piece.fill_side) {
+        let clip = match (clip_source, piece.fill_side) {
             (Some(source), Some(fill_side)) if piece.closed => Some(dash::DashClip {
                 source,
                 keep_inside: fill_side == piece.side,
@@ -448,11 +473,10 @@ pub fn stroke_aligned_with<'a>(
                 piece.true_start,
                 piece.true_end,
                 clip,
-                dash_group,
+                dash_work,
                 left,
                 right,
                 scratch,
-                band_buf,
                 output,
             ),
             (Some(d), Some(arcs)) => {
@@ -473,11 +497,10 @@ pub fn stroke_aligned_with<'a>(
                         piece.true_start,
                         piece.true_end,
                         clip,
-                        dash_group,
+                        dash_work,
                         left,
                         right,
                         scratch,
-                        band_buf,
                         output,
                     );
                 }
@@ -511,9 +534,10 @@ fn representable(path: &BezPath) -> bool {
 }
 
 /// Shared setup for the set-theoretic region construction over `normalized`
-/// contours (fill re-wound to `+1`): per-contour specs, the flattened source
-/// index behind the distance/winding predicates, and raw-offset band
-/// parameters at offset distance `w`.
+/// contours, whose fill is re-wound to `+1`. It returns per-contour specs
+/// and raw-offset band parameters at offset distance `w`, and rebuilds
+/// `index` as the flattened source behind the distance and winding
+/// predicates.
 ///
 /// The predicates must see only the participating contours: an open subpath
 /// is banded separately (its one-sided band is not a distance set), so its
@@ -531,11 +555,8 @@ fn region_setup<'a>(
     style: &StrokeStyle,
     miter_limit: f64,
     tolerance: f64,
-) -> (
-    Vec<crate::region::ContourSpec<'a>>,
-    crate::region::SourceIndex,
-    BandParams<'static>,
-) {
+    index: &mut crate::region::SourceIndex,
+) -> (Vec<crate::region::ContourSpec<'a>>, BandParams<'static>) {
     let specs = normalized
         .iter()
         .map(|els| crate::region::ContourSpec {
@@ -545,7 +566,7 @@ fn region_setup<'a>(
             fill_side: StrokeSide::Right,
         })
         .collect();
-    let index = crate::region::SourceIndex::with_joins(
+    index.rebuild_with_joins(
         normalized,
         (w * 1e-3).max(tolerance * 0.1),
         style.join,
@@ -566,7 +587,7 @@ fn region_setup<'a>(
         crossing_eps: 0.0,
         raw_offset: true,
     };
-    (specs, index, base)
+    (specs, base)
 }
 
 /// Re-wind a closed contour so that the filled side lies to the right of
@@ -626,6 +647,7 @@ pub fn analyze_subpaths(
         return infos;
     }
     let probe_scale = input.control_box().size().max_side();
+    let whole = orient::Fill::new(&input);
     for subpath in normalize::subpaths(input.elements()) {
         let closed = normalize::is_closed(subpath);
         let zero_length = normalize::is_zero_length(subpath);
@@ -635,7 +657,7 @@ pub fn analyze_subpaths(
             style.side,
             subpath,
             closed,
-            &input,
+            &whole,
             probe_scale,
         );
         infos.push(SubpathInfo {

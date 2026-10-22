@@ -17,11 +17,14 @@
 //! disk is filled there. Holes then stroke into the ring, and reversing
 //! winding directions changes nothing.
 
+use alloc::vec::Vec;
+
 use kurbo::{
     Affine, BezPath, ParamCurve, ParamCurveDeriv, ParamCurveExtrema, ParamCurveNearest, PathEl,
     PathSeg, Point, Shape, Vec2,
 };
 
+use crate::buckets::{Bands, Buckets};
 use crate::style::{StrokeAlignment, StrokeSide};
 
 /// Number of topmost-candidate points to try before giving up on probing.
@@ -43,7 +46,7 @@ pub(crate) fn resolve(
     side_override: Option<StrokeSide>,
     subpath: &[PathEl],
     closed: bool,
-    whole: &BezPath,
+    whole: &Fill<'_>,
     probe_scale: f64,
 ) -> Resolved {
     // The fill probe is only needed for closed one-sided bands.
@@ -87,7 +90,7 @@ pub(crate) fn resolve_side(
     side_override: Option<StrokeSide>,
     subpath: &[PathEl],
     closed: bool,
-    whole: &BezPath,
+    whole: &Fill<'_>,
     probe_scale: f64,
 ) -> StrokeSide {
     resolve(
@@ -112,7 +115,7 @@ impl StrokeSide {
 }
 
 /// Which side of a closed subpath faces the filled region of `whole`.
-pub(crate) fn fill_side(subpath: &[PathEl], whole: &BezPath, probe_scale: f64) -> StrokeSide {
+pub(crate) fn fill_side(subpath: &[PathEl], whole: &Fill<'_>, probe_scale: f64) -> StrokeSide {
     // Own-disk side from the subpath's signed area. The closing chord
     // counts: the slice ends with ClosePath, so `segments` emits it.
     let own_disk_right = subpath.area() >= 0.0;
@@ -129,7 +132,7 @@ pub(crate) fn fill_side(subpath: &[PathEl], whole: &BezPath, probe_scale: f64) -
                 .map(|p| (p, Ray::Up))
                 .or_else(|| probe_beside(subpath, delta, own_disk_right));
             if let Some((p_in, ray)) = probe {
-                let filled = ray.winding(whole.elements(), p_in) != 0;
+                let filled = whole.winding(ray, p_in) != 0;
                 return if filled {
                     own_disk
                 } else {
@@ -164,34 +167,132 @@ impl Ray {
     fn winding(self, els: &[PathEl], p: Point) -> i32 {
         match self {
             Ray::Left => winding(els, p),
-            Ray::Up => {
-                // Swapping the axes turns the leftward ray upwards. The swap
-                // is exact, and a mirror only flips the winding's sign.
-                // Open subpaths are closed first, as filling closes them.
-                // Left open, the count would depend on the ray's direction:
-                // a leftward ray never reaches an open polyline lying above
-                // the probe, but an upward ray can.
-                let swap = Affine::new([0.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
-                let mut swapped = BezPath::new();
-                let mut open = false;
-                for &el in els {
-                    match el {
-                        PathEl::MoveTo(_) if open => swapped.close_path(),
-                        PathEl::ClosePath => open = false,
-                        _ => open = true,
-                    }
-                    if matches!(el, PathEl::MoveTo(_)) {
-                        open = false;
-                    }
-                    swapped.push(swap * el);
-                }
-                if open {
-                    swapped.close_path();
-                }
-                winding(swapped.elements(), swap * p)
-            }
+            Ray::Up => kurbo::segments(up_ray_elements(els))
+                .map(|seg| segment_winding(&seg, SWAP * p))
+                .sum(),
         }
     }
+}
+
+/// The axis swap that turns kurbo's leftward ray upwards. It is exact, and
+/// a mirror only flips the winding's sign.
+const SWAP: Affine = Affine::new([0.0, 1.0, 1.0, 0.0, 0.0, 0.0]);
+
+/// `els` as the ray upwards counts them: axes swapped, and every open
+/// subpath closed first, as filling closes it.
+///
+/// Left open, a subpath would give a count that depends on the ray's
+/// direction. A ray to the left never reaches an open polyline that lies
+/// above the probe, but a ray upwards can.
+fn up_ray_elements(els: &[PathEl]) -> impl Iterator<Item = PathEl> + '_ {
+    closed_subpaths(els).map(|el| SWAP * el)
+}
+
+/// The filled region of the whole path, which the probe of every closed
+/// lobe is counted against.
+///
+/// Counting every segment for every lobe makes side resolution quadratic in
+/// the number of contours. But a ray meets only the segments whose control
+/// box spans the probe's height, or its `x` for the ray upwards.
+/// [`segment_winding`] returns zero for every other segment without further
+/// work. So the segments are bucketed by that span, once per ray, on the
+/// first probe along it, and a probe counts only its own bucket. A segment
+/// is listed in every band its span meets, and the band of a height never
+/// decreases as the height grows. So the probe's bucket holds every segment
+/// whose span holds the probe's height, and the count is the same. This
+/// needs finite coordinates, which the input gate ensures.
+pub(crate) struct Fill<'a> {
+    whole: &'a BezPath,
+    /// The buckets for the ray to the left. Only probes beside steep
+    /// segments use it.
+    left: core::cell::OnceCell<SegmentBuckets>,
+    /// The buckets for the ray upwards, in swapped axes.
+    up: core::cell::OnceCell<SegmentBuckets>,
+}
+
+impl<'a> Fill<'a> {
+    pub(crate) fn new(whole: &'a BezPath) -> Fill<'a> {
+        Fill {
+            whole,
+            left: core::cell::OnceCell::new(),
+            up: core::cell::OnceCell::new(),
+        }
+    }
+
+    /// The winding number of the whole path at `p`, counted along `ray`.
+    fn winding(&self, ray: Ray, p: Point) -> i32 {
+        match ray {
+            Ray::Left => self
+                .left
+                .get_or_init(|| SegmentBuckets::new(kurbo::segments(self.whole.iter()).collect()))
+                .winding(p),
+            Ray::Up => self
+                .up
+                .get_or_init(|| {
+                    SegmentBuckets::new(
+                        kurbo::segments(up_ray_elements(self.whole.elements())).collect(),
+                    )
+                })
+                .winding(SWAP * p),
+        }
+    }
+}
+
+/// Segments listed by the bands of heights their control boxes span.
+struct SegmentBuckets {
+    segs: Vec<PathSeg>,
+    bands: Bands,
+    buckets: Buckets,
+}
+
+impl SegmentBuckets {
+    fn new(segs: Vec<PathSeg>) -> SegmentBuckets {
+        let spans: Vec<(f64, f64)> = segs
+            .iter()
+            .map(|seg| {
+                let b = crate::clip::control_box(seg);
+                (b.y0, b.y1)
+            })
+            .collect();
+        let bands = Bands::fine(&spans);
+        SegmentBuckets {
+            buckets: Buckets::new(&bands, &spans),
+            bands,
+            segs,
+        }
+    }
+
+    fn winding(&self, p: Point) -> i32 {
+        self.buckets
+            .get(self.bands.of(p.y))
+            .iter()
+            .map(|&i| segment_winding(&self.segs[i as usize], p))
+            .sum()
+    }
+}
+
+/// `els` with every open subpath closed, as filling closes it. A
+/// `ClosePath` goes in before each `MoveTo` that follows drawing, and at
+/// the end if the last subpath is open.
+fn closed_subpaths(els: &[PathEl]) -> impl Iterator<Item = PathEl> + '_ {
+    let mut open = false;
+    let mut pending: Option<PathEl> = None;
+    let mut rest = els.iter().copied();
+    core::iter::from_fn(move || {
+        if let Some(el) = pending.take() {
+            return Some(el);
+        }
+        let Some(el) = rest.next() else {
+            return core::mem::take(&mut open).then_some(PathEl::ClosePath);
+        };
+        let was_open = open;
+        open = !matches!(el, PathEl::MoveTo(_) | PathEl::ClosePath);
+        if matches!(el, PathEl::MoveTo(_)) && was_open {
+            pending = Some(el);
+            return Some(PathEl::ClosePath);
+        }
+        Some(el)
+    })
 }
 
 /// A point verified to lie inside the subpath's own disk.
@@ -319,6 +420,11 @@ pub(crate) fn winding(els: &[PathEl], p: Point) -> i32 {
         .sum()
 }
 
+/// The winding of `seg` alone at `p`, along the ray to the left.
+///
+/// It is zero, with no further work, when `p` lies above, below or to the
+/// left of the control box. [`Fill`] relies on that to count only the
+/// segments listed in the probe's band.
 fn segment_winding(seg: &PathSeg, p: Point) -> i32 {
     let bounds = crate::clip::control_box(seg);
     if p.y < bounds.y0 || p.y > bounds.y1 || p.x < bounds.x0 {
@@ -415,6 +521,77 @@ mod tests {
     use crate::normalize;
     use kurbo::Rect;
 
+    /// The upward ray streams the elements it used to copy into a closed,
+    /// swapped path. The stream must match the copy: an open subpath is
+    /// closed before the `MoveTo` that follows it and at the end, and closed
+    /// and empty subpaths stay as they are. The winding at random points
+    /// must match the copy's too.
+    #[test]
+    fn up_ray_closes_subpaths_as_the_copy_did() {
+        let copy = |els: &[PathEl]| {
+            let mut closed = BezPath::new();
+            let mut open = false;
+            for &el in els {
+                match el {
+                    PathEl::MoveTo(_) if open => closed.close_path(),
+                    PathEl::ClosePath => open = false,
+                    _ => open = true,
+                }
+                if matches!(el, PathEl::MoveTo(_)) {
+                    open = false;
+                }
+                closed.push(el);
+            }
+            if open {
+                closed.close_path();
+            }
+            closed
+        };
+        let mut paths = Vec::new();
+        // Open, then closed, then open to the end.
+        let mut p = BezPath::new();
+        p.move_to((0.0, 0.0));
+        p.line_to((50.0, 80.0));
+        p.quad_to((90.0, 0.0), (20.0, 40.0));
+        p.move_to((10.0, 10.0));
+        p.line_to((60.0, 10.0));
+        p.line_to((60.0, 60.0));
+        p.close_path();
+        p.move_to((-20.0, 30.0));
+        p.curve_to((100.0, -40.0), (100.0, 120.0), (0.0, 70.0));
+        paths.push(p);
+        // Empty subpaths: a `MoveTo` after a `MoveTo`, and one at the end.
+        let mut p = BezPath::new();
+        p.move_to((0.0, 0.0));
+        p.move_to((5.0, 5.0));
+        p.line_to((70.0, 20.0));
+        p.line_to((30.0, 90.0));
+        p.close_path();
+        p.move_to((40.0, 40.0));
+        paths.push(p);
+        let mut state = 0x6a09_e667_f3bc_c908_u64;
+        let mut rand = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as f64 / (1u64 << 53) as f64 * 140.0 - 30.0
+        };
+        for path in paths {
+            let els = path.elements();
+            let closed = copy(els);
+            assert_eq!(closed_subpaths(els).collect::<Vec<_>>(), closed.elements());
+            let swapped = SWAP * closed;
+            for _ in 0..500 {
+                let p = Point::new(rand(), rand());
+                assert_eq!(
+                    Ray::Up.winding(els, p),
+                    winding(swapped.elements(), SWAP * p),
+                    "{p:?}"
+                );
+            }
+        }
+    }
+
     fn closed_rect_cw() -> BezPath {
         // CW in Y-down: positive area.
         let mut p = BezPath::new();
@@ -430,7 +607,14 @@ mod tests {
         let scale = path.bounding_box().size().max_side();
         let els = path.elements();
         let sub = normalize::subpaths(els).next().unwrap();
-        resolve_side(alignment, None, sub, normalize::is_closed(sub), path, scale)
+        resolve_side(
+            alignment,
+            None,
+            sub,
+            normalize::is_closed(sub),
+            &Fill::new(path),
+            scale,
+        )
     }
 
     #[test]
@@ -476,7 +660,14 @@ mod tests {
             let scale = p.bounding_box().size().max_side();
             let els = p.elements();
             let hole_sub = normalize::subpaths(els).nth(1).unwrap();
-            let side = resolve_side(StrokeAlignment::Inside, None, hole_sub, true, &p, scale);
+            let side = resolve_side(
+                StrokeAlignment::Inside,
+                None,
+                hole_sub,
+                true,
+                &Fill::new(&p),
+                scale,
+            );
             if hole_ccw {
                 // CCW hole: own disk (void) on the left ⇒ ring on the right.
                 assert_eq!(
@@ -503,8 +694,22 @@ mod tests {
         let scale = p.bounding_box().size().max_side();
         let els = p.elements();
         let subs: alloc::vec::Vec<&[PathEl]> = normalize::subpaths(els).collect();
-        let s0 = resolve_side(StrokeAlignment::Inside, None, subs[0], true, &p, scale);
-        let s1 = resolve_side(StrokeAlignment::Inside, None, subs[1], true, &p, scale);
+        let s0 = resolve_side(
+            StrokeAlignment::Inside,
+            None,
+            subs[0],
+            true,
+            &Fill::new(&p),
+            scale,
+        );
+        let s1 = resolve_side(
+            StrokeAlignment::Inside,
+            None,
+            subs[1],
+            true,
+            &Fill::new(&p),
+            scale,
+        );
         assert_eq!(s0, StrokeSide::Right, "CW contour: inside on the right");
         assert_eq!(s1, StrokeSide::Left, "CCW contour: inside on the left");
     }
@@ -518,11 +723,25 @@ mod tests {
         let els = p.elements();
         let sub = normalize::subpaths(els).next().unwrap();
         assert_eq!(
-            resolve_side(StrokeAlignment::Inside, None, sub, false, &p, scale),
+            resolve_side(
+                StrokeAlignment::Inside,
+                None,
+                sub,
+                false,
+                &Fill::new(&p),
+                scale
+            ),
             StrokeSide::Right
         );
         assert_eq!(
-            resolve_side(StrokeAlignment::Outside, None, sub, false, &p, scale),
+            resolve_side(
+                StrokeAlignment::Outside,
+                None,
+                sub,
+                false,
+                &Fill::new(&p),
+                scale
+            ),
             StrokeSide::Left
         );
         assert_eq!(
@@ -531,11 +750,88 @@ mod tests {
                 Some(StrokeSide::Left),
                 sub,
                 false,
-                &p,
+                &Fill::new(&p),
                 scale
             ),
             StrokeSide::Left
         );
+    }
+
+    /// Counting only a probe's bucket gives the same winding as counting
+    /// every segment, along both rays. The probes are random points, the
+    /// anchors, where rays graze, and the band boundaries and an ulp either
+    /// side, where a probe moves to the next bucket.
+    #[test]
+    fn bucketed_counts_match_counting_every_segment() {
+        let mut whole = kurbo::Circle::new((100.0, 100.0), 80.0).to_path(1e-3);
+        whole.extend(
+            kurbo::Circle::new((90.0, 110.0), 30.0)
+                .to_path(1e-3)
+                .reverse_subpaths()
+                .iter(),
+        );
+        // An open polyline, which the upward ray closes, and curves.
+        whole.move_to((10.0, 10.0));
+        whole.line_to((190.0, 40.0));
+        whole.line_to((60.0, 170.0));
+        whole.move_to((20.0, 150.0));
+        whole.curve_to((200.0, 20.0), (0.0, 20.0), (180.0, 150.0));
+        whole.quad_to((150.0, 200.0), (40.0, 190.0));
+        whole.close_path();
+        let fill = Fill::new(&whole);
+        let mut probes: alloc::vec::Vec<Point> = whole
+            .elements()
+            .iter()
+            .filter_map(|el| el.end_point())
+            .collect();
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..3000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let x = (state >> 11) as f64 / (1u64 << 53) as f64;
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let y = (state >> 11) as f64 / (1u64 << 53) as f64;
+            probes.push(Point::new(x * 220.0 - 10.0, y * 220.0 - 10.0));
+        }
+        // The band boundaries of each ray. For the ray to the left they are
+        // heights across the segments' control boxes. For the ray upwards
+        // they are `x` values across the boxes of the closed path.
+        let boundaries = |spans: alloc::vec::Vec<(f64, f64)>| {
+            let lo = spans.iter().map(|s| s.0).fold(f64::INFINITY, f64::min);
+            let hi = spans.iter().map(|s| s.1).fold(f64::NEG_INFINITY, f64::max);
+            let n = (spans.len() / 4).clamp(1, 256);
+            (0..=n).map(move |k| lo + (hi - lo) * k as f64 / n as f64)
+        };
+        let boxes = |els: alloc::vec::Vec<PathEl>| {
+            kurbo::segments(els)
+                .map(|seg| crate::clip::control_box(&seg))
+                .collect::<alloc::vec::Vec<_>>()
+        };
+        let ulps = |v: f64, k: i64| f64::from_bits((v.to_bits() as i64 + k) as u64);
+        let rows = boxes(whole.elements().to_vec());
+        let columns = boxes(closed_subpaths(whole.elements()).collect());
+        for (k, y) in boundaries(rows.iter().map(|b| (b.y0, b.y1)).collect()).enumerate() {
+            for nudge in [-1, 0, 1] {
+                probes.push(Point::new(10.0 + k as f64 * 7.0 % 180.0, ulps(y, nudge)));
+            }
+        }
+        for (k, x) in boundaries(columns.iter().map(|b| (b.x0, b.x1)).collect()).enumerate() {
+            for nudge in [-1, 0, 1] {
+                probes.push(Point::new(ulps(x, nudge), 10.0 + k as f64 * 7.0 % 180.0));
+            }
+        }
+        for p in probes {
+            for ray in [Ray::Left, Ray::Up] {
+                assert_eq!(
+                    fill.winding(ray, p),
+                    ray.winding(whole.elements(), p),
+                    "{p:?}"
+                );
+            }
+        }
     }
 
     /// The loop of `M20,150 C200,20 0,20 180,150`, cut off as a lobe, is a
@@ -552,12 +848,13 @@ mod tests {
         let scale = whole.control_box().size().max_side();
         for accuracy in [0.25, 1e-3] {
             let split =
-                crate::split::split_self_intersections(whole.elements(), false, accuracy).unwrap();
+                crate::split::split_self_intersections(whole.elements(), false, accuracy, false)
+                    .unwrap();
             let lobe = split.pieces.iter().find(|p| p.closed).unwrap();
             let lobe = lobe.els.elements();
             assert!(lobe.area() < 0.0, "disk on the left");
             assert_eq!(winding(lobe, Point::new(100.0, 52.5 + 2e-4)), -1);
-            assert_eq!(fill_side(lobe, &whole, scale), StrokeSide::Left);
+            assert_eq!(fill_side(lobe, &Fill::new(&whole), scale), StrokeSide::Left);
         }
     }
 }

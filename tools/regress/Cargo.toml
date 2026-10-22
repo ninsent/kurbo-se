@@ -1,0 +1,36 @@
+[package]
+name = "kurbo-se-regress"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Geometric golden-output regression suite: compares kurbo-se against a pinned reference revision"
+license = "Apache-2.0 OR MIT"
+
+# A standalone workspace, so this tool never joins (or is captured by) a
+# workspace in the repository around it.
+[workspace]
+
+[dependencies]
+# The candidate: the working tree being optimized.
+kurbo-se = { path = "../.." }
+# The reference revision, extracted by `setup-ref.sh` with its package
+# renamed so both versions link into one binary.
+kurbo-se-ref = { path = "../../target/regress-ref" }
+# Must resolve to the same kurbo as both kurbo-se versions, so that
+# `kurbo::BezPath` is one type across the comparison.
+kurbo = { version = "0.13.1", default-features = false, features = ["std"] }
+# Glyph outlines for the text cases.
+skrifa = { version = "0.44", default-features = false, features = ["std"] }
+
+[profile.release]
+debug = false
+# The stroker under test is compiled exactly as a user would get it.
+opt-level = 3
+
+[profile.test]
+# The comparator self-tests stroke and compare real outlines; unoptimized
+# they are needlessly slow.
+opt-level = 2
+
+[lints.rust]
+unsafe_code = "forbid"
